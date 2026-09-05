@@ -1,0 +1,35 @@
+services:
+  # ── Backend (FastAPI / Uvicorn) ───────────────────────────────────────────────
+  - type: web
+    name: revguard-api
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: revguard-db
+          property: connectionString
+      - key: APP_ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: POLICY_FILE
+        value: policy.yaml
+      - key: TZ
+        value: Asia/Kolkata
+      # Secrets — set these manually in the Render dashboard, NOT here:
+      # RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
+      # LLM_PROVIDER, GROQ_API_KEY, ANTHROPIC_API_KEY
+      # ALLOWED_ORIGINS  (your Vercel URL, e.g. https://revguard.vercel.app)
+
+  # ── Database (PostgreSQL) ─────────────────────────────────────────────────────
+databases:
+  - name: revguard-db
+    databaseName: revguard
+    user: revguard
+    plan: free
+    region: singapore

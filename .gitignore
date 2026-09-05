@@ -1,0 +1,30 @@
+# Python
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Database files (never commit dev SQLite)
+*.db
+*.db-shm
+*.db-wal
+
+# Coverage
+.coverage
+htmlcov/
+
+# Sensitive docs (spec PDFs, internal plans)
+/RevGuard_Specification_Track03.pdf
+/RevGuard_Refined_Implementation_Plan.md
+
+# Frontend
+frontend/node_modules/
+frontend/.env.local
+frontend/dist/
+frontend/.vercel/

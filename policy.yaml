@@ -1,0 +1,33 @@
+# Policy-as-Code for RevGuard
+# All guardrail thresholds live here — none are hardcoded in Python.
+# Changing this file and restarting (or hot-reloading) the service immediately
+# changes every guardrail boundary in the pipeline.
+
+# ── Retry / lifecycle guardrails ─────────────────────────────────────────────
+max_retry_attempts: 3               # Circuit-breaker fires on the 4th attempt
+
+# ── Anti-spam / quiet-hours ───────────────────────────────────────────────────
+anti_spam_cooldown_hours: 4         # Minimum gap between outreach attempts
+quiet_hours_start: "21:00"          # TRAI: no outreach after 9 PM IST
+quiet_hours_end: "09:00"            # TRAI: no outreach before 9 AM IST
+timezone: "Asia/Kolkata"
+
+# ── LLM confidence gate ───────────────────────────────────────────────────────
+min_confidence_for_autonomous_action: 0.75  # Below this → ESCALATED_HUMAN_ATTENTION
+
+# ── Channel eligibility ───────────────────────────────────────────────────────
+voice_call_min_amount_inr: 100      # Don't make voice calls for trivially small amounts
+
+# ── Cost-benefit optimizer ────────────────────────────────────────────────────
+channel_unit_cost_inr:
+  sms: 0.20
+  whatsapp: 0.40
+  voice: 2.50
+
+# ── Tone / compliance filter ──────────────────────────────────────────────────
+# Any outreach message matching these keywords is rejected before dispatch.
+stop_keywords:
+  - "unauthorized"
+  - "fraud"
+  - "unsubscribe"
+  - "stop"

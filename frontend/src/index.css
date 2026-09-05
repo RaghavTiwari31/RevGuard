@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-surface-0 text-text-primary antialiased;
+    background-image: none; /* Removed gradient */
+  }
+}
+
+@layer utilities {
+  .panel {
+    @apply bg-surface-2 border border-surface-3 rounded-lg shadow-sm;
+  }
+  .panel-header {
+    @apply bg-surface-2 border-b border-surface-3 px-4 py-3 rounded-t-lg;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
