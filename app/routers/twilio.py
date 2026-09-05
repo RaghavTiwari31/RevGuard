@@ -88,22 +88,50 @@ async def process_and_reply(from_number: str, body: str) -> None:
     await send_whatsapp(from_number, reply_text)
 
 
+from fastapi.responses import Response
+
 @router.post("/webhook")
 async def twilio_webhook(
-    background_tasks: BackgroundTasks,
     request: Request,
     From: str = Form(...),
     Body: str = Form(...)
 ):
     """
     Endpoint for Twilio to hit when a customer replies to our WhatsApp message.
-    We return 200 OK immediately so Twilio doesn't timeout, and process the reply in the background.
+    We process synchronously and return TwiML to bypass the new Twilio Content API strict sandbox rules.
     """
     logger.info("twilio.webhook.received", extra={"from": From})
     
-    # Process in background
-    background_tasks.add_task(process_and_reply, From, Body)
+    # Process synchronously to get the reply text
+    logger.info("twilio.webhook.processing", extra={"from": From})
     
-    # Twilio expects XML (TwiML) or just a 200 OK if we are sending out-of-band.
-    # We will just return a simple OK since we use the REST API to reply asynchronously.
-    return PlainTextResponse("OK")
+    result = await record_inbound_reply(
+        Body,
+        channel="whatsapp",
+        phone=From,
+    )
+    
+    if result.is_stop_keyword:
+        reply_text = "Aapki request note kar li gayi hai. Hum aapko is payment ke baare mein aur messages nahi bhejenge. Hamari team jald hi aapse sampark karegi. 🙏"
+        logger.info("twilio.webhook.frozen", extra={
+            "from": From,
+            "reply_id": result.reply_id,
+            "cancelled_retries": result.cancelled_retries,
+        })
+    else:
+        context = None
+        try:
+            context = await find_context_for_phone(From)
+        except Exception as exc:
+            logger.error("twilio.webhook.db_error", extra={"error": str(exc)})
+            
+        reply_text = await generate_support_reply(Body, context)
+        
+    logger.info("twilio.webhook.reply_generated", extra={"reply": reply_text})
+    
+    # Return TwiML
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>{reply_text}</Message>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")

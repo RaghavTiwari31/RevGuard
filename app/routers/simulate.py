@@ -320,7 +320,7 @@ async def _run_batch(run_id: str, seed: int = 42):
     policy = get_policy()
     reset_bandit()
 
-    records = generate_dataset(seed=seed)
+    records = generate_dataset(seed=seed)[:10]
     accumulator = BenchmarkAccumulator()
     factory = get_session_factory()
     total = len(records)

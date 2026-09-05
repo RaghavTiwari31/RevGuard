@@ -8,7 +8,7 @@ max_retry_attempts: 3               # Circuit-breaker fires on the 4th attempt
 
 # ── Anti-spam / quiet-hours ───────────────────────────────────────────────────
 anti_spam_cooldown_hours: 4         # Minimum gap between outreach attempts
-quiet_hours_start: "21:00"          # TRAI: no outreach after 9 PM IST
+quiet_hours_start: "22:00"          # TRAI: no outreach after 10 PM IST
 quiet_hours_end: "09:00"            # TRAI: no outreach before 9 AM IST
 timezone: "Asia/Kolkata"
 
