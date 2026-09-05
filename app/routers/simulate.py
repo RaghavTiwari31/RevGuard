@@ -25,29 +25,34 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bandit import record_reward, reset_bandit, select_channel_bandit, get_bandit_stats
+from app.bandit import flush_state as flush_bandit_state
+from app.bandit import get_bandit_stats, record_reward, reset_bandit
+from app.bandit import maybe_flush as maybe_flush_bandit
 from app.channels import Channel
-from app.classifier import FailureCategory, classify
 from app.dataset import generate_dataset
-from app.db import Base, Event, IdempotencyLock, Trace, get_session_factory
-from app.issuer_radar import IssuerBinStats, record_failure
-from app.llm import get_llm_rationale
+from app.db import Trace, get_session_factory
+from app.llm import llm_enabled
 from app.logging_config import get_logger
 from app.policy import get_policy
-from app.shadow_ledger import ShadowLedger
+from app.shadow_ledger import ShadowLedger, expected_recovery_rate
 from app.sse import broadcast
-from app.strategies.dispatcher import ActionType, dispatch_action
+from app.strategies.dispatcher import ActionType
 from app.triage import run_triage
-from app.validator import run_post_flight
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+# Actions where the channel is a real choice the bandit made, and so a real
+# experiment to learn from.
+_LEARNABLE_ACTIONS = frozenset({
+    ActionType.GENERATE_PAYMENT_LINK,
+    ActionType.SEND_MANDATE_LINK,
+})
 
 # ── In-memory run state ────────────────────────────────────────────────────────
 _current_run: dict | None = None
@@ -117,6 +122,7 @@ class BenchmarkAccumulator:
             amount_inr=amount,
             category=cat,
             action_type=action,
+            channel=result.get("dispatch_channel"),
         )
         self.revguard_recovered_inr += shadow_entry.revguard_recovered_inr
         self.naive_recovered_inr += shadow_entry.naive_recovered_inr
@@ -173,7 +179,12 @@ async def _process_one(
     trace_id = f"trc_{uuid.uuid4().hex}"
 
     # ── Throttle LLM call (token bucket) ─────────────────────────────────────
-    await _throttle.acquire()
+    # Only rate-limit when a real provider call will actually be made.  With no
+    # API key configured every rationale comes from a canned template and no
+    # network request happens, so throttling would add ~2.5 minutes of pure
+    # sleeping to a 100-record demo run for nothing.
+    if llm_enabled():
+        await _throttle.acquire()
 
     # ── Idempotency: use a fresh event_id for each simulation run ─────────────
     # (prefix with run_id to avoid collisions across runs)
@@ -199,15 +210,56 @@ async def _process_one(
     )
 
     # ── Bandit: record reward signal ──────────────────────────────────────────
-    if triage.strategy.dispatch_record:
-        channel = triage.strategy.dispatch_record.channel
-        # Reward = shadow ledger recovery rate for this action
-        from app.shadow_ledger import _REVGUARD_RECOVERY_RATES
-        reward = _REVGUARD_RECOVERY_RATES.get(triage.action_type.value, 0.0)
-        record_reward(triage.category.value, channel, reward)
+    # Only score genuine recovery attempts.  A circuit-breaker acknowledgement
+    # is sent on a fixed channel and is not trying to recover anything, so
+    # feeding it back would credit an arm the bandit never chose.
+    record = triage.strategy.dispatch_record
+    if record and record.channel != Channel.NONE and triage.action_type in _LEARNABLE_ACTIONS:
+        record_reward(
+            triage.category.value,
+            record.channel,
+            expected_recovery_rate(
+                action_type=triage.action_type.value,
+                channel=record.channel.value,
+                amount_inr=amount_inr,
+            ),
+        )
+
+    # ── Persist the trace ─────────────────────────────────────────────────────
+    # The batch runner used to broadcast over SSE and keep totals in memory
+    # only, so a 100-record run left nothing behind: refresh the dashboard and
+    # the entire benchmark was gone. Writing the same Trace row a live webhook
+    # writes means history, filtering and the stats rollup all work identically
+    # for simulated and real traffic.
+    trace_dict = triage.to_trace_dict()
+    session.add(Trace(
+        trace_id=trace_id,
+        event_id=sim_event_id,
+        category=trace_dict["category"],
+        action_type=trace_dict["action_type"],
+        outcome_status=trace_dict["outcome_status"],
+        confidence_score=trace_dict["confidence"],
+        rationale=trace_dict["rationale"],
+        hinglish_message=trace_dict["hinglish_message"],
+        llm_provider=trace_dict["provider_used"],
+        dispatch_channel=trace_dict["dispatch_channel"],
+        dispatch_cost_inr=trace_dict["dispatch_cost_inr"],
+        razorpay_link_id=trace_dict["razorpay_link_id"],
+        razorpay_link_url=trace_dict["razorpay_link_url"],
+        classification_rule=trace_dict["classification_rule"],
+        amount_inr=amount_inr,
+        triage_metadata=json.dumps(triage.strategy.metadata, default=str),
+        retry_scheduled_at=triage.strategy.retry_scheduled_at,
+        pre_flight_passed=True,
+        guardrail_checks=json.dumps({
+            "idempotency_passed": True,
+            "retry_cap_passed": attempt_number <= policy.max_retry_attempts,
+            "quiet_hours_passed": True,
+            "anti_spam_passed": True,
+        }),
+    ))
 
     # ── Build result dict ─────────────────────────────────────────────────────
-    trace_dict = triage.to_trace_dict()
     result = {
         "event_id": sim_event_id,
         "trace_id": trace_id,
@@ -254,7 +306,14 @@ async def _process_one(
 
 
 async def _run_batch(run_id: str, seed: int = 42):
-    """Background task: run the full 100-record batch and broadcast results."""
+    """
+    Background task: run the full 100-record batch and broadcast results.
+
+    The run state is always resolved to a terminal value, so an unexpected
+    failure can never leave `_current_run` wedged in "running" — that state
+    makes POST /simulate return 409 forever with no way to recover short of
+    restarting the service.
+    """
     global _current_run
 
     logger.info("simulate.batch_start", extra={"run_id": run_id})
@@ -264,16 +323,67 @@ async def _run_batch(run_id: str, seed: int = 42):
     records = generate_dataset(seed=seed)
     accumulator = BenchmarkAccumulator()
     factory = get_session_factory()
+    total = len(records)
 
-    _current_run = {"run_id": run_id, "status": "running", "progress": 0, "total": len(records)}
+    _current_run = {"run_id": run_id, "status": "running", "progress": 0, "total": total}
 
     # Broadcast run start
     await broadcast({
         "type": "batch_start",
         "run_id": run_id,
-        "total": len(records),
+        "total": total,
         "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
     })
+
+    try:
+        summary = await _process_records(records, accumulator, factory, policy, run_id, total)
+        await flush_bandit_state()
+    except Exception as exc:
+        logger.error("simulate.batch_failed", extra={"run_id": run_id, "error": str(exc)})
+        _current_run = {
+            "run_id": run_id,
+            "status": "failed",
+            "progress": (_current_run or {}).get("progress", 0),
+            "total": total,
+            "error": str(exc),
+        }
+        await broadcast({
+            "type": "batch_failed",
+            "run_id": run_id,
+            "error": str(exc),
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        })
+        raise
+
+    _current_run = {
+        "run_id": run_id,
+        "status": "complete",
+        "progress": total,
+        "total": total,
+        "summary": summary,
+    }
+
+    await broadcast({
+        "type": "batch_complete",
+        "run_id": run_id,
+        "progress": total,
+        "total": total,
+        "summary": summary,
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+    })
+
+    logger.info("simulate.batch_complete", extra={
+        "run_id": run_id,
+        "yield_pct": summary["revguard_yield_pct"],
+        "guardrail_violations": summary["guardrail_violations"],
+    })
+
+    return summary
+
+
+async def _process_records(records, accumulator, factory, policy, run_id: str, total: int) -> dict:
+    """Drive every record through the pipeline, streaming progress as it goes."""
+    global _current_run
 
     for i, record in enumerate(records, start=1):
         try:
@@ -286,20 +396,23 @@ async def _run_batch(run_id: str, seed: int = 42):
                         policy=policy,
                         run_id=run_id,
                         index=i,
-                        total=len(records),
+                        total=total,
                     )
             accumulator.add(result)
             _current_run["progress"] = i
 
+            # Persist learned weights periodically rather than only at the end,
+            # so a spin-down mid-batch does not throw away what was learned.
+            await maybe_flush_bandit()
+
             # Broadcast running summary every 5 events
-            if i % 5 == 0 or i == len(records):
-                summary = accumulator.summary()
+            if i % 5 == 0 or i == total:
                 await broadcast({
                     "type": "batch_progress",
                     "run_id": run_id,
                     "progress": i,
-                    "total": len(records),
-                    "summary": summary,
+                    "total": total,
+                    "summary": accumulator.summary(),
                     "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
                 })
 
@@ -309,24 +422,184 @@ async def _run_batch(run_id: str, seed: int = 42):
             })
             # Continue processing remaining records
 
-    # Final summary
-    summary = accumulator.summary()
-    _current_run = {"run_id": run_id, "status": "complete", "summary": summary}
+    return accumulator.summary()
 
-    await broadcast({
-        "type": "batch_complete",
+
+# ── A/B: adaptive bandit vs. deterministic selection ──────────────────────────
+
+async def _run_ab_comparison(run_id: str, seed: int, warm: bool = False) -> dict:
+    """
+    Run the same dataset under both channel-selection strategies and report the
+    difference.
+
+    Both arms see byte-identical inputs (same seed, same records, same order),
+    so every difference in the result is attributable to channel selection and
+    nothing else.  That is the point: it turns "we have an adaptive bandit" from
+    a claim into a measurement — and it is equally capable of showing that the
+    bandit lost, which on a single cold batch it usually does.
+
+    Two modes, because they answer different questions:
+
+      cold (default)
+        Both arms start with no learning.  This measures the *cost of
+        exploration*: a fresh bandit must spend real outreach on measuring arms
+        it will later reject, and one 100-record batch is rarely long enough to
+        earn that back.  This is the honest number for a first-ever run.
+
+      warm
+        The bandit arm processes the dataset once to learn, and is then measured
+        on a second pass.  This is the *steady-state* number, and it is the one
+        that matters in production, where weights persist across batches and
+        across restarts (see `bandit.load_state`) rather than resetting every
+        time.
+
+    Runs sequentially rather than concurrently — a free-tier worker has one
+    core, and two concurrent batches would contend for it, distorting both the
+    comparison and the wall-clock.
+    """
+    policy = get_policy()
+    original = policy.enable_adaptive_channel_bandit
+
+    arms: dict[str, dict] = {}
+    try:
+        for arm_name, use_bandit in (("bandit", True), ("deterministic", False)):
+            policy.enable_adaptive_channel_bandit = use_bandit
+
+            # Each arm starts from a blank slate, otherwise the second arm would
+            # inherit the first one's learning and the comparison is meaningless.
+            reset_bandit()
+
+            factory = get_session_factory()
+
+            if warm and use_bandit:
+                # Training pass — results discarded, only the learning is kept.
+                await broadcast({
+                    "type": "ab_arm_start",
+                    "run_id": run_id,
+                    "arm": "bandit_warmup",
+                    "total": 100,
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+                })
+                await _process_records(
+                    generate_dataset(seed=seed),
+                    BenchmarkAccumulator(),
+                    factory,
+                    policy,
+                    f"{run_id}_warmup",
+                    100,
+                )
+
+            accumulator = BenchmarkAccumulator()
+            records = generate_dataset(seed=seed)
+
+            await broadcast({
+                "type": "ab_arm_start",
+                "run_id": run_id,
+                "arm": arm_name,
+                "total": len(records),
+                "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+            })
+
+            summary = await _process_records(
+                records, accumulator, factory, policy, f"{run_id}_{arm_name}", len(records)
+            )
+            arms[arm_name] = summary
+    finally:
+        # Always restore the operator's setting, even if an arm blew up.
+        policy.enable_adaptive_channel_bandit = original
+        reset_bandit()
+
+    bandit = arms["bandit"]
+    deterministic = arms["deterministic"]
+
+    cost_delta = bandit["total_cost_inr"] - deterministic["total_cost_inr"]
+    recovery_delta = bandit["revguard_recovered_inr"] - deterministic["revguard_recovered_inr"]
+    net_delta = bandit["net_recovery_inr"] - deterministic["net_recovery_inr"]
+
+    if net_delta > 0:
+        verdict = "bandit"
+    elif net_delta < 0:
+        verdict = "deterministic"
+    else:
+        verdict = "tie"
+
+    return {
         "run_id": run_id,
-        "summary": summary,
+        "seed": seed,
+        "mode": "warm" if warm else "cold",
+        "measures": (
+            "steady-state performance, bandit pre-trained on one pass"
+            if warm
+            else "cold-start performance, including the bandit's exploration cost"
+        ),
+        "arms": arms,
+        "delta": {
+            "cost_inr": round(cost_delta, 2),
+            "recovered_inr": round(recovery_delta, 2),
+            "net_recovery_inr": round(net_delta, 2),
+            "yield_pct": round(
+                bandit["revguard_yield_pct"] - deterministic["revguard_yield_pct"], 2
+            ),
+        },
+        "verdict": verdict,
+        "summary": (
+            f"Bandit net {'+' if net_delta >= 0 else '-'}Rs {abs(net_delta):,.2f} "
+            f"vs deterministic on {bandit['total_records']} records"
+        ),
+    }
+
+
+async def _run_ab(run_id: str, seed: int, warm: bool = False) -> None:
+    """Background driver for the A/B comparison."""
+    global _current_run
+
+    total = 300 if warm else 200
+    _current_run = {
+        "run_id": run_id, "status": "running", "mode": "ab", "progress": 0, "total": total,
+    }
+    await broadcast({
+        "type": "ab_start",
+        "run_id": run_id,
+        "seed": seed,
+        "warm": warm,
         "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
     })
 
-    logger.info("simulate.batch_complete", extra={
+    try:
+        result = await _run_ab_comparison(run_id, seed, warm=warm)
+    except Exception as exc:
+        logger.error("simulate.ab_failed", extra={"run_id": run_id, "error": str(exc)})
+        _current_run = {"run_id": run_id, "status": "failed", "mode": "ab", "error": str(exc)}
+        await broadcast({
+            "type": "batch_failed",
+            "run_id": run_id,
+            "error": str(exc),
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        })
+        return
+
+    _current_run = {
         "run_id": run_id,
-        "yield_pct": summary["revguard_yield_pct"],
-        "guardrail_violations": summary["guardrail_violations"],
+        "status": "complete",
+        "mode": "ab",
+        "progress": total,
+        "total": total,
+        "ab_result": result,
+        "summary": result["arms"]["bandit"],
+    }
+
+    await broadcast({
+        "type": "ab_complete",
+        "run_id": run_id,
+        "result": result,
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
     })
 
-    return summary
+    logger.info("simulate.ab_complete", extra={
+        "run_id": run_id,
+        "verdict": result["verdict"],
+        "net_delta_inr": result["delta"]["net_recovery_inr"],
+    })
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -358,6 +631,51 @@ async def start_simulation(
         "message": "Batch simulation started. Connect to /stream for live updates.",
         "stream_url": "/stream",
         "total_records": 100,
+    }
+
+
+@router.post("/simulate/ab", tags=["benchmark"])
+async def start_ab_comparison(
+    background_tasks: BackgroundTasks,
+    seed: int = Query(default=42, description="Random seed — both arms use the same one"),
+    warm: bool = Query(
+        default=False,
+        description=(
+            "Pre-train the bandit on one pass before measuring it. "
+            "False measures cold-start (including exploration cost); "
+            "True measures steady state, which is what production sees."
+        ),
+    ),
+):
+    """
+    Run the benchmark under both channel-selection strategies and report the
+    difference in cost, recovery and net ROI.
+
+    Both arms process identical records in identical order, so the delta is
+    attributable to channel selection alone.
+    """
+    global _current_run
+
+    if _current_run and _current_run.get("status") == "running":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "A batch run is already in progress",
+                "run_id": _current_run["run_id"],
+            },
+        )
+
+    run_id = uuid.uuid4().hex[:12]
+    background_tasks.add_task(_run_ab, run_id=run_id, seed=seed, warm=warm)
+
+    return {
+        "status": "started",
+        "mode": "ab",
+        "warm": warm,
+        "run_id": run_id,
+        "message": "A/B comparison started. Connect to /stream for live updates.",
+        "stream_url": "/stream",
+        "total_records": 300 if warm else 200,
     }
 
 

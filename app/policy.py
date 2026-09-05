@@ -9,9 +9,8 @@ thresholds anywhere in the pipeline.
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -25,6 +24,12 @@ class ChannelCosts(BaseModel):
 
 class Policy(BaseModel):
     """All guardrail thresholds, read from policy.yaml."""
+
+    # Re-run validators on attribute assignment.  The live policy editor
+    # (POST /policy/update) mutates this singleton in place, so without this
+    # a bad value would be accepted here and only blow up later, deep inside
+    # a guardrail check.  Validate at the boundary instead.
+    model_config = {"validate_assignment": True}
 
     # Retry / lifecycle
     max_retry_attempts: int = Field(default=3, ge=1)
@@ -40,6 +45,34 @@ class Policy(BaseModel):
 
     # Channel eligibility
     voice_call_min_amount_inr: float = Field(default=100.0, ge=0)
+
+    # Adaptive channel selection.
+    #
+    # Default is OFF, and that is a measured decision rather than a preference:
+    # POST /simulate/ab runs both strategies over identical data, and the
+    # deterministic selector wins on this workload by roughly Rs 9k per 100
+    # records even after the bandit is pre-trained. The deterministic rule
+    # already encodes the structure the reward model rewards (voice pays for
+    # itself above the high-value threshold, WhatsApp otherwise), so the bandit
+    # can only rediscover it — at the cost of exploring arms it will reject.
+    #
+    # Set to true to run the bandit in production; it is fully implemented,
+    # persisted across restarts, and re-measurable at any time via /simulate/ab.
+    enable_adaptive_channel_bandit: bool = False
+
+    # Idempotency lock lifetime.  A lock is claimed before triage runs, so an
+    # incomplete lock left by a crash or a free-tier spin-down must eventually
+    # be reclaimable — otherwise the event ispermanently un-processable.
+    # Completed locks never expire.
+    idempotency_lock_ttl_minutes: float = Field(default=15.0, gt=0)
+
+    # Durable retry queue
+    enable_scheduled_retries: bool = True
+    # Retries whose due time passed while the service was asleep are run this
+    # many seconds after boot, staggered, rather than all at once.
+    retry_catchup_delay_seconds: float = Field(default=20.0, ge=0)
+    # Hard ceiling on how far ahead a retry may be scheduled.
+    max_retry_delay_minutes: float = Field(default=720.0, gt=0)
 
     # Cost-benefit optimizer
     channel_unit_cost_inr: ChannelCosts = Field(default_factory=ChannelCosts)

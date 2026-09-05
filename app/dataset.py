@@ -32,12 +32,16 @@ from __future__ import annotations
 import random
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 
 from faker import Faker
 
 fake = Faker("en_IN")
-random.seed(42)  # Reproducible dataset across runs
+
+# Use a private RNG rather than the global one.  Seeding `random` at module
+# import reaches every other consumer in the process — including the channel
+# bandit's exploration draws — so "reproducible dataset" would silently mean
+# "reproducible bandit", defeating the point of the exploration.
+_rng = random.Random(42)
 
 # ── Category specs ────────────────────────────────────────────────────────────
 
@@ -95,7 +99,7 @@ _BANKS = ["HDFC Bank", "ICICI Bank", "SBI", "Axis Bank", "Kotak Bank", "Yes Bank
 
 def _make_amount_paise(avg_inr: int, jitter_pct: float = 0.3) -> int:
     """Generate a realistic amount with ±jitter% variation, rounded to ₹10."""
-    delta = int(avg_inr * jitter_pct * (random.random() * 2 - 1))
+    delta = int(avg_inr * jitter_pct * (_rng.random() * 2 - 1))
     amount_inr = max(100, avg_inr + delta)
     # Round to nearest ₹10
     amount_inr = round(amount_inr / 10) * 10
@@ -126,8 +130,8 @@ def _make_payment_entity(
         "error_reason": error_reason,
         "error_source": "bank",
         "error_step": "payment_authorization",
-        "bank": random.choice(_BANKS),
-        "card_id": f"{random.choice(_BINS)}{fake.numerify('##########')}",
+        "bank": _rng.choice(_BANKS),
+        "card_id": f"{_rng.choice(_BINS)}{fake.numerify('##########')}",
         # Metadata for the batch runner
         "_cat_tag": cat_tag,
         "_attempt_number": attempt_number,
@@ -143,15 +147,15 @@ def generate_dataset(
     Returns a list of Razorpay webhook payload dicts.
     Each record goes through the exact same code path as a live webhook.
     """
-    random.seed(seed)
+    _rng.seed(seed)
     Faker.seed(seed)
 
     records: list[dict] = []
 
     for cat_tag, count, avg_inr, codes, reasons in _CAT_SPECS:
         for i in range(count):
-            error_code = random.choice(codes)
-            error_reason = random.choice(reasons)
+            error_code = _rng.choice(codes)
+            error_reason = _rng.choice(reasons)
             amount_paise = _make_amount_paise(avg_inr)
 
             # CAT_06: simulate 3 prior attempts so retry cap is hit
@@ -181,7 +185,7 @@ def generate_dataset(
             records.append(record)
 
     # Shuffle so categories are interspersed (realistic)
-    random.shuffle(records)
+    _rng.shuffle(records)
     return records
 
 

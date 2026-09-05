@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-
 # ── Category enum ─────────────────────────────────────────────────────────────
 
 class FailureCategory(str, Enum):

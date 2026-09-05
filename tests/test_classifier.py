@@ -6,8 +6,6 @@ Covers all five categories and the classification priority order.
 
 from __future__ import annotations
 
-import pytest
-
 from app.classifier import FailureCategory, classify
 
 

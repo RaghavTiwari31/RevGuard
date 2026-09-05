@@ -2,10 +2,16 @@
 RevGuard — Webhook router
 
 Handles:
-  POST /webhook  — Razorpay signed webhook
-  GET  /health   — Health check (also used by Render pinger)
+  POST /webhook        — Razorpay signed webhook (payment failures)
+  POST /webhook/reply  — inbound customer SMS/WhatsApp reply
 
-Phase 2 update: wires in the full triage pipeline after pre-flight.
+(/health lives in app.main — it is an app-level concern, not a webhook one.)
+
+Signature verification is mandatory in production.  In development, an unset
+RAZORPAY_WEBHOOK_SECRET degrades to a loud warning so the pipeline can be
+exercised without Razorpay credentials; in production that same configuration
+would leave an unauthenticated endpoint that triggers real outreach, so the
+service refuses the request outright.
 """
 
 from __future__ import annotations
@@ -19,13 +25,15 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 
-from app.db import Customer, Event, Trace, get_session_factory
-from app.guardrails import run_pre_flight
+from app.classifier import classify
+from app.db import Customer, CustomerReply, Event, Trace, get_session_factory
+from app.guardrails import complete_idempotency, run_pre_flight
 from app.logging_config import get_logger
-from app.policy import get_policy
-from app.schemas import HealthResponse, RazorpayWebhookPayload, TraceEvent
+from app.retry_queue import cancel_retries_for_event
+from app.schemas import RazorpayWebhookPayload
 from app.sse import broadcast
 from app.triage import run_triage
 
@@ -34,6 +42,55 @@ router = APIRouter()
 
 
 # ── Signature verification ────────────────────────────────────────────────────
+
+def is_production() -> bool:
+    return os.getenv("APP_ENV", "development").strip().lower() == "production"
+
+
+def require_signature(raw_body: bytes, signature: Optional[str]) -> None:
+    """
+    Enforce webhook authenticity, raising an HTTPException if it cannot be established.
+
+    With a secret configured the HMAC must match.  Without one:
+      - development → proceed, with a loud warning, so the pipeline is testable
+        without Razorpay credentials
+      - production  → refuse.  An unauthenticated webhook here means anyone who
+        finds the URL can inject payment failures and make the system send real
+        customer outreach.  Failing closed is the only safe default, and it
+        surfaces the misconfiguration immediately instead of silently.
+    """
+    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+
+    if not webhook_secret:
+        if is_production():
+            logger.error("webhook.rejected", extra={
+                "reason": "RAZORPAY_WEBHOOK_SECRET is not set and APP_ENV=production",
+            })
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Webhook signature verification is not configured. "
+                    "Set RAZORPAY_WEBHOOK_SECRET before serving production traffic."
+                ),
+            )
+        logger.warning("webhook.signature_verification_skipped", extra={
+            "reason": "RAZORPAY_WEBHOOK_SECRET not set — skipping signature check (dev mode)",
+        })
+        return
+
+    if not signature:
+        logger.warning("webhook.rejected", extra={"reason": "Missing X-Razorpay-Signature header"})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing webhook signature"
+        )
+
+    if not verify_razorpay_signature(raw_body, signature, webhook_secret):
+        logger.warning("webhook.rejected", extra={"reason": "Invalid HMAC signature"})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature"
+        )
+
+
 
 def verify_razorpay_signature(raw_body: bytes, signature: str, secret: str) -> bool:
     """
@@ -47,20 +104,6 @@ def verify_razorpay_signature(raw_body: bytes, signature: str, secret: str) -> b
         digestmod=hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
-
-
-# ── Health check ──────────────────────────────────────────────────────────────
-
-@router.get("/health", response_model=HealthResponse, tags=["ops"])
-async def health_check():
-    """Lightweight health check — used by Render pinger and judges."""
-    policy = get_policy()
-    return HealthResponse(
-        status="ok",
-        version="1.0.0",
-        db="connected",
-        policy_loaded=policy is not None,
-    )
 
 
 # ── Webhook handler ───────────────────────────────────────────────────────────
@@ -87,20 +130,7 @@ async def razorpay_webhook(
     raw_body = await request.body()
 
     # ── 1. Signature verification ─────────────────────────────────────────────
-    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-
-    if webhook_secret:
-        if not x_razorpay_signature:
-            logger.warning("webhook.rejected", extra={"reason": "Missing X-Razorpay-Signature header"})
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing webhook signature")
-
-        if not verify_razorpay_signature(raw_body, x_razorpay_signature, webhook_secret):
-            logger.warning("webhook.rejected", extra={"reason": "Invalid HMAC signature"})
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
-    else:
-        logger.warning("webhook.signature_verification_skipped", extra={
-            "reason": "RAZORPAY_WEBHOOK_SECRET not set — skipping signature check (dev mode)"
-        })
+    require_signature(raw_body, x_razorpay_signature)
 
     # ── 2. Parse payload ──────────────────────────────────────────────────────
     try:
@@ -222,6 +252,9 @@ async def razorpay_webhook(
                 trace_row.retry_scheduled_at = triage.strategy.retry_scheduled_at
 
             session.add(trace_row)
+            # The lock stops expiring now: this event is definitively processed,
+            # so from here it is a genuine duplicate-suppression record.
+            await complete_idempotency(session, event_id)
 
     logger.info("webhook.triage_complete", extra={
         "event_id": event_id,
@@ -263,4 +296,142 @@ async def razorpay_webhook(
         "outcome_status": triage.outcome_status.value,
         "confidence": triage.confidence,
         "razorpay_link_url": triage.strategy.razorpay_payment_link_url,
+    }
+
+
+# ── Inbound customer replies ──────────────────────────────────────────────────
+
+class CustomerReplyPayload(BaseModel):
+    """
+    An inbound SMS/WhatsApp reply.
+
+    Shaped to be filled from any aggregator's inbound webhook — the field names
+    are ours, the mapping is done by whatever forwards the message to us.
+    """
+
+    body: str = Field(..., min_length=1, max_length=4096, description="Raw message text")
+    phone: Optional[str] = Field(default=None, max_length=32)
+    customer_id: Optional[str] = Field(default=None, max_length=128)
+    event_id: Optional[str] = Field(default=None, max_length=128, description="Payment this reply is about")
+    channel: str = Field(default="sms", max_length=32)
+
+
+@router.post("/webhook/reply", tags=["webhook"])
+async def customer_reply(
+    payload: CustomerReplyPayload,
+    request: Request,
+    x_razorpay_signature: Optional[str] = Header(default=None, alias="X-Razorpay-Signature"),
+):
+    """
+    Handle an inbound customer reply.
+
+    This closes the loop the classifier was already built for: `classify()` has
+    always accepted a `customer_reply` argument, but nothing ever supplied one,
+    so the DISPUTE_OR_OPTOUT path could only ever be reached through an error
+    description — never through a customer actually saying "stop".
+
+    On a stop keyword or dispute signal the response is immediate and total:
+      1. the reply is stored verbatim, so the decision is auditable
+      2. every pending retry for the payment is cancelled
+      3. the customer is marked as contacted, freezing further outreach
+      4. the freeze is broadcast to the dashboard
+
+    Everything else is recorded and acknowledged without changing automation.
+    """
+    require_signature(await request.body(), x_razorpay_signature)
+
+    reply_id = f"rpl_{uuid.uuid4().hex[:16]}"
+    now = datetime.now(timezone.utc)
+
+    # The classifier is the single source of truth for what a reply means —
+    # the same deterministic rules the payment path uses, no second opinion.
+    classification = classify(
+        error_code=None,
+        error_reason=None,
+        error_description=None,
+        customer_reply=payload.body,
+    )
+    is_stop = classification.is_stop_keyword
+
+    logger.info("reply.received", extra={
+        "reply_id": reply_id,
+        "event_id": payload.event_id,
+        "channel": payload.channel,
+        "category": classification.category.value,
+        "is_stop_keyword": is_stop,
+    })
+
+    cancelled = 0
+    action_taken = "LOGGED_NO_ACTION"
+    factory = get_session_factory()
+
+    async with factory() as session:
+        async with session.begin():
+            if is_stop:
+                action_taken = "AUTOMATION_FROZEN"
+
+                if payload.event_id:
+                    cancelled = await cancel_retries_for_event(
+                        session,
+                        payload.event_id,
+                        f"Customer reply classified as {classification.category.value}",
+                    )
+
+                # Push last_contacted_at forward so the anti-spam guardrail
+                # suppresses outreach even on paths that do not consult the
+                # retry queue at all.
+                if payload.customer_id:
+                    customer = (
+                        await session.execute(
+                            select(Customer).where(Customer.customer_id == payload.customer_id)
+                        )
+                    ).scalars().first()
+                    if customer is None:
+                        customer = Customer(
+                            customer_id=payload.customer_id, phone=payload.phone
+                        )
+                        session.add(customer)
+                    customer.last_contacted_at = now
+
+            session.add(CustomerReply(
+                reply_id=reply_id,
+                event_id=payload.event_id,
+                customer_id=payload.customer_id,
+                phone=payload.phone,
+                channel=payload.channel,
+                body=payload.body,
+                category=classification.category.value,
+                is_stop_keyword=is_stop,
+                action_taken=action_taken,
+                received_at=now,
+            ))
+
+    if is_stop:
+        logger.warning("reply.automation_frozen", extra={
+            "reply_id": reply_id,
+            "event_id": payload.event_id,
+            "customer_id": payload.customer_id,
+            "cancelled_retries": cancelled,
+            "matched_rule": classification.matched_rule,
+        })
+        await broadcast({
+            "type": "automation_frozen",
+            "reply_id": reply_id,
+            "event_id": payload.event_id,
+            "customer_id": payload.customer_id,
+            "category": classification.category.value,
+            "matched_rule": classification.matched_rule,
+            "cancelled_retries": cancelled,
+            "body": payload.body[:280],
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+        })
+
+    return {
+        "status": "frozen" if is_stop else "acknowledged",
+        "reply_id": reply_id,
+        "category": classification.category.value,
+        "matched_rule": classification.matched_rule,
+        "is_stop_keyword": is_stop,
+        "action_taken": action_taken,
+        "cancelled_retries": cancelled,
     }

@@ -1,124 +1,224 @@
 import React from 'react'
+import {
+  Activity,
+  ChevronRight,
+  ExternalLink,
+  Link2,
+  MessageSquare,
+  PhoneCall,
+  RefreshCcw,
+  ShieldAlert,
+  Smartphone,
+} from 'lucide-react'
+
 import { useStore } from '../store/useStore'
-import { ShieldAlert, CheckCircle2, ChevronRight, Activity, ArrowRightCircle, ExternalLink, MessageSquare, PhoneCall, Smartphone } from 'lucide-react'
+import {
+  actionLabel,
+  categoryStyle,
+  channelLabel,
+  formatINR,
+  formatTime,
+  isFrozen,
+  outcomeStyle,
+} from '../lib/format'
 
-const catColors = {
-  TRANSIENT_DOWNTIME: 'text-status-info-text bg-status-info-bg border-status-info-border',
-  TEMPORARY_CASHFLOW: 'text-status-warning-text bg-status-warning-bg border-status-warning-border',
-  EXPIRED_MANDATE: 'text-brand-light bg-brand/20 border-brand/30',
-  ESCALATED_HUMAN_ATTENTION: 'text-status-danger-text bg-status-danger-bg border-status-danger-border',
-  UNRECOVERABLE_FRAUD: 'text-purple-400 bg-purple-900/30 border-purple-800/50',
-  DISPUTE_OR_OPTOUT: 'text-orange-400 bg-orange-900/30 border-orange-800/50',
-  CIRCUIT_BREAKER: 'text-status-danger-text bg-status-danger-bg border-status-danger-border'
+const ACTION_ICONS = {
+  SCHEDULE_RETRY: Activity,
+  GENERATE_PAYMENT_LINK: Link2,
+  SEND_MANDATE_LINK: RefreshCcw,
+  ESCALATED_HUMAN_ATTENTION: ShieldAlert,
+  DROPPED_NO_ACTION: ShieldAlert,
 }
 
-function ActionIcon({ type }) {
-  switch (type) {
-    case 'SCHEDULE_RETRY': return <Activity className="w-3.5 h-3.5" />;
-    case 'GENERATE_PAYMENT_LINK': return <ExternalLink className="w-3.5 h-3.5" />;
-    case 'SEND_MANDATE_LINK': return <RefreshCcw className="w-3.5 h-3.5" />;
-    case 'ESCALATED_HUMAN_ATTENTION': return <ShieldAlert className="w-3.5 h-3.5" />;
-    case 'DROPPED_NO_ACTION': return <ShieldAlert className="w-3.5 h-3.5" />;
-    default: return <ArrowRightCircle className="w-3.5 h-3.5" />;
-  }
+const CHANNEL_ICONS = {
+  whatsapp: MessageSquare,
+  sms: Smartphone,
+  voice: PhoneCall,
 }
 
-function RefreshCcw(props) { return <svg {...props} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg> }
+const CHANNEL_CLASSES = {
+  whatsapp: 'text-channel-whatsapp',
+  sms: 'text-channel-sms',
+  voice: 'text-channel-voice',
+}
 
-export default function TransactionTable() {
-  const { events, setSelectedEvent, selectedEvent } = useStore()
+/** Short, readable handle for a payment id — the tail is the distinguishing part. */
+const shortId = (eventId) => {
+  if (typeof eventId !== 'string' || !eventId) return '—'
+  const tail = eventId.split('_').pop()
+  return tail && tail.length > 4 ? tail.slice(0, 12) : eventId
+}
 
-  if (events.length === 0) {
-    return (
-      <div className="panel flex-1 flex flex-col items-center justify-center text-text-tertiary p-8 text-center min-h-[400px]">
-        <Activity className="w-8 h-8 mb-3 opacity-20" />
-        <p className="text-sm">No transactions to display.</p>
-        <p className="text-xs mt-1 opacity-70">Start a simulation batch from the sidebar.</p>
+function EmptyState() {
+  return (
+    <div className="panel flex min-h-[420px] flex-1 flex-col items-center justify-center gap-1 p-8 text-center">
+      <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-full border border-surface-3 bg-surface-1">
+        <Activity className="h-5 w-5 text-text-tertiary" aria-hidden="true" />
       </div>
-    )
-  }
+      <p className="text-sm font-medium text-text-secondary">No transactions yet</p>
+      <p className="max-w-xs text-xs text-text-tertiary">
+        Start a batch from the sidebar, or POST a Razorpay webhook to{' '}
+        <code className="rounded bg-surface-1 px-1 py-0.5 font-mono text-2xs text-text-secondary">
+          /webhook
+        </code>
+        .
+      </p>
+    </div>
+  )
+}
+
+function Row({ event, isSelected, onSelect }) {
+  const category = categoryStyle(event.category)
+  const outcome = outcomeStyle(event.outcome_status)
+  const frozen = isFrozen(event.action_type)
+  const ActionIcon = ACTION_ICONS[event.action_type] ?? ChevronRight
+  const ChannelIcon = CHANNEL_ICONS[event.dispatch_channel]
 
   return (
-    <div className="panel flex-1 flex flex-col overflow-hidden">
-      <div className="panel-header flex justify-between items-center">
-        <h2 className="text-sm font-semibold tracking-tight">Recent Transactions</h2>
-        <span className="text-xs text-text-tertiary">{events.length} events</span>
+    <tr
+      onClick={() => onSelect(event)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onSelect(event)
+        }
+      }}
+      tabIndex={0}
+      role="button"
+      aria-label={`Transaction ${shortId(event.event_id)}, ${category.label}`}
+      className={`group animate-row-in cursor-pointer transition-colors ${
+        isSelected ? 'bg-brand-500/10' : 'hover:bg-surface-3/40'
+      }`}
+    >
+      {/* Selected-row marker, drawn inside the first cell so it never shifts layout. */}
+      <td className="relative whitespace-nowrap py-2.5 pl-4 pr-3">
+        {isSelected && (
+          <span className="absolute inset-y-0 left-0 w-0.5 bg-brand-500" aria-hidden="true" />
+        )}
+        <div className="flex flex-col leading-tight">
+          <span className="font-mono text-[11px] text-text-primary">
+            {shortId(event.event_id)}
+          </span>
+          <span className="mt-0.5 text-2xs text-text-tertiary">
+            {formatTime(event.timestamp)}
+          </span>
+        </div>
+      </td>
+
+      <td className="whitespace-nowrap px-3 py-2.5 text-right font-medium text-text-primary">
+        {formatINR(event.amount_inr)}
+      </td>
+
+      <td className="px-3 py-2.5">
+        <span className={`pill ${category.className}`}>{category.label}</span>
+      </td>
+
+      <td className="whitespace-nowrap px-3 py-2.5">
+        <span className="flex items-center gap-1.5 font-medium text-text-primary">
+          <ActionIcon
+            className={`h-3.5 w-3.5 shrink-0 ${
+              frozen ? 'text-status-danger-text' : 'text-text-tertiary'
+            }`}
+            aria-hidden="true"
+          />
+          {actionLabel(event.action_type)}
+        </span>
+      </td>
+
+      <td className="px-3 py-2.5">
+        {event.dispatch_channel && event.dispatch_channel !== 'none' && !frozen ? (
+          <span className="pill border-surface-3 bg-surface-1 text-text-secondary">
+            {ChannelIcon && (
+              <ChannelIcon
+                className={`h-3 w-3 ${CHANNEL_CLASSES[event.dispatch_channel] ?? ''}`}
+                aria-hidden="true"
+              />
+            )}
+            {channelLabel(event.dispatch_channel)}
+          </span>
+        ) : (
+          <span className="text-text-tertiary" aria-label="No outreach">
+            —
+          </span>
+        )}
+      </td>
+
+      <td className="px-3 py-2.5">
+        <span className={`pill ${outcome.className}`}>{outcome.label}</span>
+      </td>
+
+      <td className="w-8 py-2.5 pr-4 text-right">
+        <ChevronRight
+          className={`ml-auto h-4 w-4 transition-opacity ${
+            isSelected
+              ? 'text-brand-400 opacity-100'
+              : 'text-text-tertiary opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100'
+          }`}
+          aria-hidden="true"
+        />
+      </td>
+    </tr>
+  )
+}
+
+export default function TransactionTable() {
+  const { events, selectedEvent, setSelectedEvent, isRunning } = useStore()
+
+  if (events.length === 0) return <EmptyState />
+
+  return (
+    <div className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="panel-header">
+        <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-text-primary">
+          Live Transactions
+        </h2>
+        <span className="pill border-surface-3 bg-surface-1 text-text-tertiary">
+          {isRunning && (
+            <span
+              className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand-400"
+              aria-hidden="true"
+            />
+          )}
+          <span className="tabular">{events.length}</span> events
+        </span>
       </div>
-      
-      <div className="flex-1 overflow-auto scrollbar-hide">
-        <table className="w-full text-left border-collapse">
-          <thead className="sticky top-0 bg-surface-2 border-b border-surface-3 text-[10px] uppercase tracking-wider text-text-tertiary">
+
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto">
+        <table className="w-full border-collapse text-left text-xs text-text-secondary">
+          <thead className="sticky top-0 z-10 bg-surface-2 text-2xs uppercase tracking-label text-text-tertiary shadow-[0_1px_0_0_theme(colors.surface.3)]">
             <tr>
-              <th className="py-2.5 px-4 font-medium">Time / ID</th>
-              <th className="py-2.5 px-4 font-medium text-right">Amount</th>
-              <th className="py-2.5 px-4 font-medium">Category</th>
-              <th className="py-2.5 px-4 font-medium">Action Taken</th>
-              <th className="py-2.5 px-4 font-medium">Channel</th>
-              <th className="py-2.5 px-4 font-medium text-right pr-6">Status</th>
+              <th scope="col" className="py-2.5 pl-4 pr-3 font-semibold">
+                Payment / Time
+              </th>
+              <th scope="col" className="px-3 py-2.5 text-right font-semibold">
+                Amount
+              </th>
+              <th scope="col" className="px-3 py-2.5 font-semibold">
+                Category
+              </th>
+              <th scope="col" className="px-3 py-2.5 font-semibold">
+                Action
+              </th>
+              <th scope="col" className="px-3 py-2.5 font-semibold">
+                Channel
+              </th>
+              <th scope="col" className="px-3 py-2.5 font-semibold">
+                Outcome
+              </th>
+              <th scope="col" className="w-8 pr-4">
+                <span className="sr-only">Open details</span>
+              </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-surface-3/50 text-xs text-text-secondary">
-            {events.map((ev) => {
-              const isSelected = selectedEvent?.trace_id === ev.trace_id;
-              const isDropped = ev.action_type === 'DROPPED_NO_ACTION' || ev.action_type === 'ESCALATED_HUMAN_ATTENTION';
-              
-              return (
-                <tr 
-                  key={ev.trace_id}
-                  onClick={() => setSelectedEvent(ev)}
-                  className={`
-                    cursor-pointer transition-colors group
-                    ${isSelected ? 'bg-surface-3/50' : 'hover:bg-surface-3/30'}
-                  `}
-                >
-                  <td className="py-3 px-4 whitespace-nowrap">
-                    <div className="flex flex-col">
-                      <span className="text-text-primary font-mono">{ev.event_id.split('_').pop()}</span>
-                      <span className="text-[10px] text-text-tertiary mt-0.5">{new Date(ev.timestamp).toLocaleTimeString()}</span>
-                    </div>
-                  </td>
-                  <td className="py-3 px-4 font-mono text-text-primary text-right whitespace-nowrap">
-                    ₹{ev.amount_inr}
-                  </td>
-                  <td className="py-3 px-4">
-                    <span className={`inline-flex px-2 py-0.5 rounded border text-[10px] font-medium tracking-wide ${catColors[ev.category] || 'text-gray-400 border-gray-700'}`}>
-                      {ev.category.replace(/_/g, ' ')}
-                    </span>
-                  </td>
-                  <td className="py-3 px-4">
-                    <div className="flex items-center gap-1.5 text-text-primary font-medium">
-                      <ActionIcon type={ev.action_type} />
-                      {ev.action_type.replace(/_/g, ' ')}
-                    </div>
-                  </td>
-                  <td className="py-3 px-4">
-                    {ev.dispatch_channel && !isDropped ? (
-                      <span className="inline-flex items-center gap-1 text-[10px] uppercase text-text-secondary bg-surface-3 px-1.5 py-0.5 rounded">
-                        {ev.dispatch_channel === 'whatsapp' ? <MessageSquare className="w-3 h-3" /> :
-                         ev.dispatch_channel === 'sms' ? <Smartphone className="w-3 h-3" /> :
-                         <PhoneCall className="w-3 h-3" />}
-                        {ev.dispatch_channel}
-                      </span>
-                    ) : (
-                      <span className="text-text-tertiary">-</span>
-                    )}
-                  </td>
-                  <td className="py-3 px-4 pr-6 text-right relative">
-                    <div className="flex justify-end items-center gap-2">
-                      {isDropped ? (
-                        <ShieldAlert className="w-4 h-4 text-status-danger-text" />
-                      ) : (
-                        <CheckCircle2 className="w-4 h-4 text-status-success-text" />
-                      )}
-                    </div>
-                    {/* Hover indicator for clickability */}
-                    <div className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity ${isSelected ? 'opacity-100 text-brand' : 'text-text-tertiary'}`}>
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
+          <tbody className="divide-y divide-surface-3/60">
+            {events.map((event) => (
+              <Row
+                key={event.trace_id ?? event.event_id}
+                event={event}
+                isSelected={selectedEvent?.trace_id === event.trace_id}
+                onSelect={setSelectedEvent}
+              />
+            ))}
           </tbody>
         </table>
       </div>

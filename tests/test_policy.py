@@ -14,9 +14,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
-import yaml
 
-from app.policy import Policy, load_policy
+from app.policy import load_policy
 
 
 class TestPolicyLoader:

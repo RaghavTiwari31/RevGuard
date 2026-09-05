@@ -10,8 +10,6 @@ import hmac
 import json
 import uuid
 
-import pytest
-
 
 def _make_payload(event_id: str = None) -> dict:
     """Minimal Razorpay payment.failed webhook payload."""

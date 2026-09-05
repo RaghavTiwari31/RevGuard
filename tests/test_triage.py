@@ -11,11 +11,8 @@ Covers all Phase 2 DoD items:
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.classifier import FailureCategory

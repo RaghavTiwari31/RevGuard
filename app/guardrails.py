@@ -17,7 +17,6 @@ Every check logs a structured JSON audit line so the decision is traceable.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -27,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import Customer, Event, IdempotencyLock, Trace
+from app.db import Customer, IdempotencyLock, Trace
 from app.logging_config import get_logger
 from app.policy import Policy, get_policy
 
@@ -71,40 +70,126 @@ async def check_idempotency(
     event_id: str,
     trace_id: str,
     policy: Policy,
+    now: Optional[datetime] = None,
 ) -> GuardrailResult:
     """
     Attempt to INSERT a row into idempotency_locks.
     - Success → this is the first (and only) processor for this event.
-    - IntegrityError → a duplicate; reject.
+    - IntegrityError → a lock already exists.
 
     Using a DB-level UNIQUE constraint gives us a correct, atomic lock even
     under concurrent duplicate webhook deliveries.
+
+    Locks are claimed *before* triage runs, so a process that dies mid-pipeline
+    (a crash, or the free tier idling the service out) leaves a lock that was
+    never completed.  Treating that as a permanent duplicate would make the
+    event un-processable forever and silently swallow Razorpay's own webhook
+    retry.  So an incomplete lock past its TTL is reclaimed by the new attempt;
+    a *completed* lock is a real duplicate and is never reclaimed.
     """
-    lock = IdempotencyLock(event_id=event_id, trace_id=trace_id)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    ttl = timedelta(minutes=policy.idempotency_lock_ttl_minutes)
+
+    lock = IdempotencyLock(
+        event_id=event_id,
+        trace_id=trace_id,
+        locked_at=now,
+        expires_at=now + ttl,
+    )
     try:
         # Use a nested savepoint so an IntegrityError only rolls back the inner
         # block, leaving the outer transaction intact for subsequent checks.
         async with session.begin_nested():
             session.add(lock)
             await session.flush()  # Raises IntegrityError immediately if duplicate
-        result = GuardrailResult(
+
+        logger.info(
+            "guardrail.idempotency",
+            extra={"event_id": event_id, "passed": True, "reason": "first processing"},
+        )
+        return GuardrailResult(
             passed=True,
             check_name="idempotency",
             reason="First processing of this event_id",
         )
     except IntegrityError:
-        # Savepoint was already rolled back by the context manager — outer tx ok
+        pass  # Savepoint rolled back by the context manager — outer tx intact.
+
+    # A lock exists. Decide whether it is authoritative or abandoned.
+    existing: Optional[IdempotencyLock] = (
+        await session.execute(
+            select(IdempotencyLock).where(IdempotencyLock.event_id == event_id)
+        )
+    ).scalars().first()
+
+    if existing is None:
+        # Raced with a delete; treat as a duplicate rather than guessing.
         result = GuardrailResult(
             passed=False,
             check_name="idempotency",
             reason=f"Duplicate event_id={event_id!r} — already processed",
         )
+    elif existing.completed_at is not None:
+        result = GuardrailResult(
+            passed=False,
+            check_name="idempotency",
+            reason=f"Duplicate event_id={event_id!r} — already processed",
+            metadata={"original_trace_id": existing.trace_id},
+        )
+    else:
+        expires_at = existing.expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+        if expires_at is not None and now >= expires_at:
+            # Abandoned by a dead attempt — take it over.
+            existing.trace_id = trace_id
+            existing.locked_at = now
+            existing.expires_at = now + ttl
+            await session.flush()
+            result = GuardrailResult(
+                passed=True,
+                check_name="idempotency",
+                reason="Reclaimed an expired lock from an incomplete attempt",
+                metadata={"reclaimed_from_trace_id": existing.trace_id},
+            )
+        else:
+            result = GuardrailResult(
+                passed=False,
+                check_name="idempotency",
+                reason=f"event_id={event_id!r} is being processed by another attempt",
+                metadata={"in_flight_trace_id": existing.trace_id},
+            )
 
     logger.info(
         "guardrail.idempotency",
         extra={"event_id": event_id, "passed": result.passed, "reason": result.reason},
     )
     return result
+
+
+async def complete_idempotency(
+    session: AsyncSession,
+    event_id: str,
+    now: Optional[datetime] = None,
+) -> None:
+    """
+    Mark an event's lock as definitively processed.
+
+    Call this once the pipeline has finished.  From this point the lock stops
+    expiring and becomes a permanent duplicate-suppression record.
+    """
+    lock: Optional[IdempotencyLock] = (
+        await session.execute(
+            select(IdempotencyLock).where(IdempotencyLock.event_id == event_id)
+        )
+    ).scalars().first()
+
+    if lock is not None and lock.completed_at is None:
+        lock.completed_at = now or datetime.now(timezone.utc)
+        lock.expires_at = None
+        await session.flush()
 
 
 async def check_retry_cap(
@@ -234,7 +319,6 @@ async def check_anti_spam(
         logger.info("guardrail.anti_spam", extra={"passed": True, "reason": result.reason})
         return result
 
-    tz = ZoneInfo(policy.timezone)
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -302,7 +386,7 @@ async def run_pre_flight(
     if policy is None:
         policy = get_policy()
 
-    idempotency = await check_idempotency(session, event_id, trace_id, policy)
+    idempotency = await check_idempotency(session, event_id, trace_id, policy, now)
     retry_cap = await check_retry_cap(session, event_id, customer_id, policy)
     quiet_hours = check_quiet_hours(now, policy)
     anti_spam = await check_anti_spam(session, customer_id, policy, now)

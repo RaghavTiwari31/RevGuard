@@ -6,6 +6,11 @@ services:
     region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
+    # --workers 1 is load-bearing, not a cost saving. The retry scheduler
+    # (APScheduler), the SSE fan-out registry and the in-memory bandit cache are
+    # all per-process. A second worker would arm duplicate retry timers and
+    # split the SSE subscribers so half the dashboard updates never arrive.
+    # Scaling out means moving the scheduler to an external store first.
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
@@ -21,12 +26,21 @@ services:
         value: policy.yaml
       - key: TZ
         value: Asia/Kolkata
-      # Secrets — set these manually in the Render dashboard, NOT here:
+      # ── Secrets — set these in the Render dashboard, never in this file ──
+      #
+      # RAZORPAY_WEBHOOK_SECRET is REQUIRED. Because APP_ENV=production above,
+      # POST /webhook returns 503 until it is set, rather than accepting
+      # unauthenticated payment events that would trigger real outreach. If the
+      # first deploy answers 503 on the webhook, this is the reason.
+      #
       # RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
-      # LLM_PROVIDER, GROQ_API_KEY, ANTHROPIC_API_KEY
+      # LLM_PROVIDER, GROQ_API_KEY (or GEMINI_API_KEY) — optional; without a
+      #   key the pipeline runs on canned rationales instead of failing
       # ALLOWED_ORIGINS  (your Vercel URL, e.g. https://revguard.vercel.app)
 
   # ── Database (PostgreSQL) ─────────────────────────────────────────────────────
+  # Pending retries and learned bandit weights live here, not in process memory,
+  # so the free tier's 15-minute idle spin-down loses neither.
 databases:
   - name: revguard-db
     databaseName: revguard

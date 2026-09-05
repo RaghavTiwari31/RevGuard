@@ -8,8 +8,6 @@ DoD coverage:
 
 from __future__ import annotations
 
-import pytest
-
 from app.validator import check_amount, check_tone, run_post_flight
 
 

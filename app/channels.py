@@ -23,6 +23,10 @@ from app.policy import Policy, get_policy
 
 logger = get_logger(__name__)
 
+# A voice call must be small relative to the amount it is trying to recover.
+# At the default ₹2.50 voice cost this puts the floor at ₹5,000 of exposure.
+VOICE_COST_RATIO = 2000
+
 
 # ── Channel enum ──────────────────────────────────────────────────────────────
 
@@ -45,7 +49,35 @@ class DispatchRecord:
     metadata: dict = field(default_factory=dict)
 
 
-# ── Channel selector (epsilon-greedy bandit stub for Phase 3) ─────────────────
+# ── Channel eligibility & selection ──────────────────────────────────────────
+
+def eligible_channels(
+    amount_inr: float,
+    customer_phone: Optional[str],
+    policy: Optional[Policy] = None,
+) -> list[Channel]:
+    """
+    Return the channels this event is *allowed* to use, cheapest-first.
+
+    `voice_call_min_amount_inr` is an eligibility FLOOR, not a preference:
+    voice is simply not permitted below it because a ₹2.50 call cannot pay
+    for itself on a small ticket.  Being eligible for voice never means voice
+    is the right pick — that is the selector's job (see `select_channel` and
+    the adaptive bandit).
+    """
+    if policy is None:
+        policy = get_policy()
+
+    # Without a phone number the only thing we can reach is the SMS gateway.
+    if not customer_phone:
+        return [Channel.SMS]
+
+    channels = [Channel.SMS, Channel.WHATSAPP]
+    if amount_inr >= policy.voice_call_min_amount_inr:
+        channels.append(Channel.VOICE)
+
+    return sorted(channels, key=lambda c: get_channel_cost(c, policy))
+
 
 def select_channel(
     amount_inr: float,
@@ -53,24 +85,32 @@ def select_channel(
     policy: Optional[Policy] = None,
 ) -> Channel:
     """
-    Simple channel selection based on amount and policy.
-    Phase 3 will upgrade this to the epsilon-greedy Adaptive Channel Bandit.
+    Deterministic cost-aware channel selection — the fallback used when the
+    adaptive bandit is disabled, and the baseline the bandit is measured against.
 
     Rules:
-      - No phone → SMS (best-effort)
-      - amount >= voice_call_min_amount_inr → VOICE
-      - Default → WHATSAPP (higher engagement than SMS)
+      - No phone → SMS (only reachable channel)
+      - Ticket large enough that a voice call is worth its cost → VOICE
+      - Otherwise → WHATSAPP (better engagement than SMS, still cheap)
+
+    A voice call only earns its keep when the outreach cost is negligible next
+    to the amount at stake, so we require the ticket to be worth at least
+    `VOICE_COST_RATIO`× the call — not merely to clear the eligibility floor.
     """
     if policy is None:
         policy = get_policy()
 
-    if not customer_phone:
-        return Channel.SMS
+    eligible = eligible_channels(amount_inr, customer_phone, policy)
 
-    if amount_inr >= policy.voice_call_min_amount_inr:
-        return Channel.VOICE
+    if Channel.VOICE in eligible:
+        voice_cost = get_channel_cost(Channel.VOICE, policy)
+        if amount_inr >= voice_cost * VOICE_COST_RATIO:
+            return Channel.VOICE
 
-    return Channel.WHATSAPP
+    if Channel.WHATSAPP in eligible:
+        return Channel.WHATSAPP
+
+    return eligible[0] if eligible else Channel.SMS
 
 
 def get_channel_cost(channel: Channel, policy: Optional[Policy] = None) -> float:

@@ -2,10 +2,19 @@
 RevGuard — SQLAlchemy 2.0 async database layer
 
 Models:
-  - Event          → raw webhook payload + processing state
-  - Trace          → per-pipeline-run audit record (one per event attempt)
-  - Customer       → lightweight customer profile for cooldown / retry tracking
+  - Event           → raw webhook payload + processing state
+  - Trace           → per-pipeline-run audit record (one per event attempt)
+  - Customer        → lightweight customer profile for cooldown / retry tracking
   - IdempotencyLock → distributed lock table (row = exactly-once guarantee)
+  - ScheduledRetry  → durable retry queue, rehydrated into APScheduler at boot
+  - BanditArmStat   → persisted epsilon-greedy arm statistics
+  - CustomerReply   → inbound SMS/WhatsApp replies from customers
+
+Durability note (free-tier deployment):
+  Render's free tier spins the service down after ~15 minutes of inactivity and
+  the filesystem is ephemeral.  Anything that must outlive a cold start —
+  pending retries, learned bandit weights — therefore lives in the database,
+  not in process memory.  There is no Redis or external queue in this design.
 
 The engine is built from DATABASE_URL env var:
   - Empty / SQLite  → aiosqlite (local dev)
@@ -22,15 +31,19 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
-    event,
 )
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase
-
 
 # ── Base ─────────────────────────────────────────────────────────────────────
 
@@ -151,6 +164,15 @@ class IdempotencyLock(Base):
     One row per (event_id) — insertion is atomic; a second INSERT for the same
     event_id raises an IntegrityError which we catch to implement exactly-once
     processing.
+
+    Locks expire.  A lock is claimed *before* triage runs, so a crash (or a
+    free-tier spin-down) mid-pipeline would otherwise leave a permanent
+    tombstone: the event could never be legitimately reprocessed, and Razorpay's
+    own webhook retry would be silently swallowed forever.  `expires_at` bounds
+    that window — see `guardrails.check_idempotency`.
+
+    `completed_at` is set once the pipeline finishes.  A completed lock never
+    expires: it is a genuine duplicate-suppression record from then on.
     """
 
     __tablename__ = "idempotency_locks"
@@ -160,6 +182,110 @@ class IdempotencyLock(Base):
     event_id = Column(String(128), nullable=False, index=True)
     trace_id = Column(String(64), nullable=False)           # The trace that claimed this lock
     locked_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    # Null until the pipeline completes; non-null means "definitively processed".
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    # When an *incomplete* lock may be reclaimed by a new attempt.
+    expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class ScheduledRetry(Base):
+    """
+    A durable, restart-surviving retry queue.
+
+    APScheduler holds its jobs in memory, so on the free tier every pending
+    retry would be lost the moment the dyno idles out.  Each scheduled retry is
+    therefore written here first and only then handed to the scheduler; at boot
+    `retry_queue.rehydrate()` reloads whatever is still pending, including
+    retries whose due time passed while the service was asleep.
+    """
+
+    __tablename__ = "scheduled_retries"
+    __table_args__ = (
+        Index("ix_scheduled_retries_status_run_at", "status", "run_at"),
+    )
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_CANCELLED = "cancelled"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    retry_id = Column(String(64), nullable=False, unique=True, index=True)
+
+    event_id = Column(String(128), nullable=False, index=True)
+    origin_trace_id = Column(String(64), nullable=True)
+
+    run_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    attempt_number = Column(Integer, default=2, nullable=False)
+
+    status = Column(String(16), default=STATUS_PENDING, nullable=False, index=True)
+    reason = Column(String(256), nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    # Trace produced by the replay, once it has run.
+    result_trace_id = Column(String(64), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class BanditArmStat(Base):
+    """
+    Persisted epsilon-greedy arm statistics, one row per (segment, channel).
+
+    Without this the bandit relearns from zero on every cold start — which on a
+    free tier that idles out after 15 minutes means it effectively never learns
+    at all.
+    """
+
+    __tablename__ = "bandit_arm_stats"
+    __table_args__ = (
+        UniqueConstraint("segment", "channel", name="uq_bandit_segment_channel"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    segment = Column(String(64), nullable=False, index=True)
+    channel = Column(String(32), nullable=False)
+
+    selections = Column(Integer, default=0, nullable=False)
+    pulls = Column(Integer, default=0, nullable=False)
+    total_reward = Column(Float, default=0.0, nullable=False)
+
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class CustomerReply(Base):
+    """
+    An inbound reply from a customer (SMS / WhatsApp).
+
+    Stored verbatim before classification so the decision to freeze automation
+    on a dispute or opt-out is always traceable back to the exact words that
+    triggered it.
+    """
+
+    __tablename__ = "customer_replies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    reply_id = Column(String(64), nullable=False, unique=True, index=True)
+
+    event_id = Column(String(128), nullable=True, index=True)
+    customer_id = Column(String(128), nullable=True, index=True)
+    phone = Column(String(32), nullable=True)
+    channel = Column(String(32), default="sms", nullable=False)
+
+    body = Column(Text, nullable=False)
+
+    # Outcome of classifying the reply.
+    category = Column(String(64), nullable=True)
+    is_stop_keyword = Column(Boolean, default=False, nullable=False)
+    action_taken = Column(String(64), nullable=True)
+    trace_id = Column(String(64), nullable=True, index=True)
+
+    received_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 # ── Engine / Session factory ──────────────────────────────────────────────────
@@ -223,8 +349,6 @@ async def init_db(database_url: str | None = None) -> None:
     )
 
     async with _engine.begin() as conn:
-        # Import Phase 2 models so they are registered with Base.metadata
-        import app.issuer_radar  # noqa: F401 — registers IssuerBinStats
         await conn.run_sync(Base.metadata.create_all)
 
 
@@ -234,3 +358,14 @@ async def close_db() -> None:
     if _engine:
         await _engine.dispose()
         _engine = None
+
+
+# ── Out-of-module model registration ──────────────────────────────────────────
+# `IssuerBinStats` is declared in app.issuer_radar, next to the logic that owns
+# it. Importing it here means anyone who imports app.db gets a complete
+# Base.metadata, so `create_all` can never quietly build a partial schema
+# depending on which modules happened to be imported first.
+#
+# The import sits at the bottom because app.issuer_radar imports Base from this
+# module — by this point Base is defined, so the cycle resolves.
+from app import issuer_radar as _issuer_radar  # noqa: E402,F401

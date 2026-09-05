@@ -12,13 +12,14 @@ Exposes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from typing import Optional
 
-from app.logging_config import get_logger
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ValidationError
+
 import app.policy as _policy_module
-from app.policy import get_policy, load_policy
+from app.logging_config import get_logger
+from app.policy import Policy, get_policy, load_policy
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -31,6 +32,7 @@ class PolicyPatch(BaseModel):
     anti_spam_cooldown_hours: Optional[float] = None
     min_confidence_for_autonomous_action: Optional[float] = None
     voice_call_min_amount_inr: Optional[float] = None
+    enable_adaptive_channel_bandit: Optional[bool] = None
 
 
 @router.get("/policy", tags=["policy"])
@@ -44,6 +46,7 @@ async def get_current_policy():
         "anti_spam_cooldown_hours": policy.anti_spam_cooldown_hours,
         "min_confidence_for_autonomous_action": policy.min_confidence_for_autonomous_action,
         "voice_call_min_amount_inr": policy.voice_call_min_amount_inr,
+        "enable_adaptive_channel_bandit": policy.enable_adaptive_channel_bandit,
         "channel_unit_cost_inr": {
             "sms": policy.channel_unit_cost_inr.sms,
             "whatsapp": policy.channel_unit_cost_inr.whatsapp,
@@ -59,43 +62,30 @@ async def update_policy(patch: PolicyPatch):
     for subsequent requests — no redeploy required.
     """
     policy = get_policy()
-    changed: dict = {}
 
-    if patch.max_retry_attempts is not None:
-        if not 1 <= patch.max_retry_attempts <= 10:
-            raise HTTPException(status_code=422, detail="max_retry_attempts must be 1–10")
-        policy.max_retry_attempts = patch.max_retry_attempts
-        changed["max_retry_attempts"] = patch.max_retry_attempts
+    if patch.max_retry_attempts is not None and not 1 <= patch.max_retry_attempts <= 10:
+        raise HTTPException(status_code=422, detail="max_retry_attempts must be 1–10")
 
-    if patch.quiet_hours_start is not None:
-        policy.quiet_hours_start = patch.quiet_hours_start
-        changed["quiet_hours_start"] = patch.quiet_hours_start
+    changed = patch.model_dump(exclude_none=True)
+    if not changed:
+        raise HTTPException(status_code=422, detail="No policy fields supplied")
 
-    if patch.quiet_hours_end is not None:
-        policy.quiet_hours_end = patch.quiet_hours_end
-        changed["quiet_hours_end"] = patch.quiet_hours_end
+    # Build the candidate policy as a whole and validate it before publishing.
+    # An invalid patch must leave the live policy completely untouched — a
+    # half-applied guardrail config is worse than a rejected one.
+    try:
+        candidate = policy.model_copy(update=changed)
+        candidate = Policy.model_validate(candidate.model_dump())
+    except ValidationError as exc:
+        errors = [
+            f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}"
+            for e in exc.errors()
+        ]
+        logger.warning("policy.update_rejected", extra={"errors": errors})
+        raise HTTPException(status_code=422, detail="; ".join(errors)) from exc
 
-    if patch.anti_spam_cooldown_hours is not None:
-        if patch.anti_spam_cooldown_hours < 0:
-            raise HTTPException(status_code=422, detail="anti_spam_cooldown_hours must be >= 0")
-        policy.anti_spam_cooldown_hours = patch.anti_spam_cooldown_hours
-        changed["anti_spam_cooldown_hours"] = patch.anti_spam_cooldown_hours
-
-    if patch.min_confidence_for_autonomous_action is not None:
-        if not 0.0 <= patch.min_confidence_for_autonomous_action <= 1.0:
-            raise HTTPException(status_code=422, detail="confidence threshold must be 0.0–1.0")
-        policy.min_confidence_for_autonomous_action = patch.min_confidence_for_autonomous_action
-        changed["min_confidence_for_autonomous_action"] = patch.min_confidence_for_autonomous_action
-
-    if patch.voice_call_min_amount_inr is not None:
-        if patch.voice_call_min_amount_inr < 0:
-            raise HTTPException(status_code=422, detail="voice_call_min_amount_inr must be >= 0")
-        policy.voice_call_min_amount_inr = patch.voice_call_min_amount_inr
-        changed["voice_call_min_amount_inr"] = patch.voice_call_min_amount_inr
-
-    # Mutate the module-level singleton in place
-    # (Policy is a Pydantic model but mutation works for live editing)
-    _policy_module._policy = policy
+    # Publish atomically — swap the singleton only once the candidate is valid.
+    _policy_module._policy = candidate
 
     logger.info("policy.live_update", extra={"changed": changed})
     return {"status": "updated", "changed": changed, "policy": (await get_current_policy())}

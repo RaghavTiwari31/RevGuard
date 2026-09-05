@@ -3,24 +3,135 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    /* Inter's OpenType alternates, chosen for a data-dense dashboard:
+       cv05 = open-tailed l, cv08 = upright 6/9, cv11 = single-storey a,
+       ss03 = curved r. Together they stop l/I/1 and a/o collapsing into
+       each other at the 11-12px sizes this UI leans on. */
+    font-feature-settings: 'cv05' 1, 'cv08' 1, 'cv11' 1, 'ss03' 1, 'calt' 1;
+    font-variation-settings: normal;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
   body {
-    @apply bg-surface-0 text-text-primary antialiased;
-    background-image: none; /* Removed gradient */
+    @apply bg-surface-0 text-text-primary font-sans antialiased;
+  }
+
+  /* Every number that sits in a column or updates in place gets tabular
+     figures, so digits do not jitter as values change. */
+  .tabular,
+  table td,
+  table th {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum' 1, 'cv05' 1, 'cv08' 1, 'cv11' 1;
+  }
+
+  /* A single, consistent focus ring — visible for keyboard users, invisible
+     for mouse users. */
+  :focus-visible {
+    @apply outline-none shadow-focus-brand rounded-sm;
+  }
+
+  ::selection {
+    @apply bg-brand-500/30 text-white;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-surface-2 border border-surface-3 rounded-card shadow-card;
+  }
+
+  .panel-header {
+    @apply flex items-center justify-between gap-3 border-b border-surface-3 px-4 py-3;
+  }
+
+  /* Small uppercase section label used across the sidebar and card headers. */
+  .label {
+    @apply text-2xs font-semibold uppercase tracking-label text-text-secondary;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-2xs font-medium whitespace-nowrap;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold
+           transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-500 text-white hover:bg-brand-400 disabled:hover:bg-brand-500;
+  }
+
+  .btn-secondary {
+    @apply btn border border-surface-3 bg-surface-2 text-text-secondary
+           hover:border-surface-4 hover:text-text-primary;
+  }
+
+  .btn-ghost {
+    @apply btn px-2 py-1 text-2xs text-text-secondary hover:bg-surface-3 hover:text-text-primary;
+  }
+
+  .field {
+    @apply rounded-md border border-surface-3 bg-surface-0 px-2 py-1 text-xs text-text-primary
+           transition-colors outline-none focus:border-brand-500 disabled:opacity-50;
+  }
+
+  /* Range inputs get no useful default styling in a dark theme. */
+  .range {
+    @apply h-1 w-full cursor-pointer appearance-none rounded-full bg-surface-3
+           accent-brand-500 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .skeleton {
+    @apply animate-shimmer rounded bg-surface-3;
   }
 }
 
 @layer utilities {
-  .panel {
-    @apply bg-surface-2 border border-surface-3 rounded-lg shadow-sm;
-  }
-  .panel-header {
-    @apply bg-surface-2 border-b border-surface-3 px-4 py-3 rounded-t-lg;
-  }
   .scrollbar-hide::-webkit-scrollbar {
     display: none;
   }
+
   .scrollbar-hide {
     -ms-overflow-style: none;
     scrollbar-width: none;
+  }
+
+  /* Thin scrollbar for regions where losing the affordance would hurt. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: theme('colors.surface.4') transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-surface-4;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* Respect the OS setting — the live table and progress bars animate a lot. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

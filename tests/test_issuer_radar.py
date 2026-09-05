@@ -7,9 +7,8 @@ TRANSIENT_DOWNTIME events for that issuer into extended backoff.
 
 from __future__ import annotations
 
-import pytest
-import pytest_asyncio
 from datetime import datetime, timedelta, timezone
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.issuer_radar import (

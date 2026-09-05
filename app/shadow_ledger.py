@@ -53,12 +53,61 @@ _NAIVE_RECOVERY_RATES: dict[str, float] = {
 }
 
 
+# ── Channel response model ────────────────────────────────────────────────────
+# The recovery rates above describe the *action*.  They say nothing about the
+# channel the outreach went out on — so using them directly as the bandit's
+# reward gives every arm in a segment an identical score, and the bandit has
+# nothing to learn.  These multipliers supply the missing dimension.
+#
+# Assumptions (India, dunning outreach):
+#   WhatsApp — richest surface: the payment link renders as a tappable card and
+#              costs the customer nothing to open.  Best baseline response.
+#   SMS      — the link is bare text in a crowded inbox; reliably delivered but
+#              materially lower click-through.
+#   Voice    — no link at all, so it converts badly on small tickets.  On large
+#              ones a live conversation outperforms every text channel, which is
+#              why the payoff scales with the amount at stake.
+_CHANNEL_ENGAGEMENT: dict[str, float] = {
+    "whatsapp": 1.00,
+    "sms": 0.85,
+    "voice": 0.55,
+    "none": 0.0,
+}
+
+# Above this ticket size a voice call is worth more than any text channel.
+_VOICE_HIGH_VALUE_INR = 5_000.0
+_VOICE_HIGH_VALUE_ENGAGEMENT = 1.15
+
+
+def channel_engagement(channel: str, amount_inr: float) -> float:
+    """
+    Relative effectiveness of `channel` for a ticket of `amount_inr`.
+
+    Deterministic, so a demo run is reproducible — same input, same number.
+    """
+    if channel == "voice" and amount_inr >= _VOICE_HIGH_VALUE_INR:
+        return _VOICE_HIGH_VALUE_ENGAGEMENT
+    return _CHANNEL_ENGAGEMENT.get(channel, 0.0)
+
+
+def expected_recovery_rate(action_type: str, channel: str, amount_inr: float) -> float:
+    """
+    Probability that this (action, channel, amount) combination recovers the payment.
+
+    This is what the bandit is scored on: the action sets the ceiling, the
+    channel decides how much of it is actually realised.
+    """
+    base = _REVGUARD_RECOVERY_RATES.get(action_type, 0.0)
+    return min(1.0, base * channel_engagement(channel, amount_inr))
+
+
 @dataclass
 class ShadowEntry:
     event_id: str
     amount_inr: float
     category: str
     action_type: str
+    channel: str | None = None
 
     # Deterministic expected values (not random — reproducible for demos)
     revguard_recovered_inr: float = 0.0
@@ -81,11 +130,30 @@ class ShadowLedger:
         amount_inr: float,
         category: str,
         action_type: str,
+        channel: str | None = None,
         # Override recovery rates for testing
         revguard_rate: float | None = None,
         naive_rate: float | None = None,
     ) -> ShadowEntry:
-        rv_rate = revguard_rate if revguard_rate is not None else _REVGUARD_RECOVERY_RATES.get(action_type, 0.0)
+        """
+        Record one event's expected outcome.
+
+        When the action actually sent outreach, `channel` is folded into the
+        recovery estimate.  The bandit is *scored* on channel-adjusted recovery,
+        so the ledger has to measure the same thing — otherwise the reported
+        recovery is blind to the very decision the bandit is making, and an A/B
+        between channel strategies could only ever show a difference in cost.
+
+        Actions that send nothing (a silent retry, a circuit-breaker freeze)
+        have no channel and keep their base rate.
+        """
+        if revguard_rate is not None:
+            rv_rate = revguard_rate
+        elif channel and channel != "none":
+            rv_rate = expected_recovery_rate(action_type, channel, amount_inr)
+        else:
+            rv_rate = _REVGUARD_RECOVERY_RATES.get(action_type, 0.0)
+
         naive_rate_ = naive_rate if naive_rate is not None else _NAIVE_RECOVERY_RATES.get(category, 0.0)
 
         entry = ShadowEntry(
@@ -93,6 +161,7 @@ class ShadowLedger:
             amount_inr=amount_inr,
             category=category,
             action_type=action_type,
+            channel=channel,
             revguard_recovered_inr=round(amount_inr * rv_rate, 2),
             naive_recovered_inr=round(amount_inr * naive_rate_, 2),
         )

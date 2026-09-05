@@ -16,13 +16,40 @@ timezone: "Asia/Kolkata"
 min_confidence_for_autonomous_action: 0.75  # Below this → ESCALATED_HUMAN_ATTENTION
 
 # ── Channel eligibility ───────────────────────────────────────────────────────
-voice_call_min_amount_inr: 100      # Don't make voice calls for trivially small amounts
+# This is an eligibility FLOOR, not a preference: below it a voice call is not
+# permitted at all.  Clearing it does not mean voice gets chosen — the selector
+# still has to justify the cost.
+voice_call_min_amount_inr: 100
+
+# ── Adaptive channel selection ────────────────────────────────────────────────
+# true  → epsilon-greedy bandit learns the best channel per failure category
+# false → deterministic cost-aware selection
+#
+# Default false, decided by measurement rather than taste. `POST /simulate/ab`
+# runs both strategies over byte-identical data; the deterministic selector wins
+# by ~Rs 9,000 per 100 records even with the bandit pre-trained, because the
+# heuristic already encodes what the reward model rewards and pays nothing to
+# explore. Flip to true and re-run /simulate/ab to check that on your own data.
+enable_adaptive_channel_bandit: false
 
 # ── Cost-benefit optimizer ────────────────────────────────────────────────────
 channel_unit_cost_inr:
   sms: 0.20
   whatsapp: 0.40
   voice: 2.50
+
+# ── Idempotency ───────────────────────────────────────────────────────────────
+# How long an *incomplete* lock is held before another attempt may reclaim it.
+# A lock is taken before triage runs, so a crash mid-pipeline would otherwise
+# make the event permanently un-processable. Completed locks never expire.
+idempotency_lock_ttl_minutes: 15
+
+# ── Durable retry queue ───────────────────────────────────────────────────────
+# Scheduled retries are persisted to the database and reloaded at startup, so
+# they survive the free tier's 15-minute idle spin-down.
+enable_scheduled_retries: true
+retry_catchup_delay_seconds: 20     # Stagger for retries that came due while asleep
+max_retry_delay_minutes: 720        # Never schedule further out than 12 hours
 
 # ── Tone / compliance filter ──────────────────────────────────────────────────
 # Any outreach message matching these keywords is rejected before dispatch.

@@ -14,6 +14,9 @@ export default defineConfig({
       '/simulate': 'http://localhost:8000',
       '/policy': 'http://localhost:8000',
       '/health': 'http://localhost:8000',
+      '/traces': 'http://localhost:8000',
+      '/issuers': 'http://localhost:8000',
+      '/retries': 'http://localhost:8000',
     },
   },
 })

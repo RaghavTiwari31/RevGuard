@@ -9,11 +9,10 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field, field_serializer
-
+from pydantic import BaseModel, Field, ValidationError, field_serializer
 
 # ── Razorpay Webhook Schemas ──────────────────────────────────────────────────
 
@@ -65,7 +64,7 @@ class RazorpayWebhookPayload(BaseModel):
         """Extract the payment entity from the nested payload, if present."""
         try:
             return RazorpayPaymentEntity(**self.payload["payment"]["entity"])
-        except (KeyError, TypeError, Exception):
+        except (KeyError, TypeError, ValidationError):
             return None
 
 
@@ -94,11 +93,13 @@ class TraceEvent(BaseModel):
     confidence: Optional[float] = None
     guardrail_checks: Optional[GuardrailChecks] = None
     pre_flight_rejection_reason: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_serializer("timestamp")
     def serialize_timestamp(self, v: datetime) -> str:
-        return v.isoformat() + "Z"
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ── Health Check ──────────────────────────────────────────────────────────────
@@ -107,4 +108,5 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "1.0.0"
     db: str = "connected"
+    env: str = "development"
     policy_loaded: bool = True

@@ -12,8 +12,9 @@ Design rules (from the implementation plan):
   - If the LLM call fails or times out, we fall back to a canned template
     for the category — the pipeline MUST NOT 500 due to an LLM failure.
   - Provider is pluggable via the LLM_PROVIDER env var (groq | gemini).
-  - A token-bucket throttle is applied by the batch runner (Phase 3); here
-    we only add a per-call timeout.
+  - The batch runner applies a token-bucket throttle around these calls (and
+    skips it entirely when no key is configured); here we only add a per-call
+    timeout.
 """
 
 from __future__ import annotations
@@ -160,6 +161,7 @@ async def _call_groq(prompt: str) -> dict:
 async def _call_gemini(prompt: str) -> dict:
     """Call Google Gemini (gemini-2.5-flash) using the new google-genai SDK."""
     import json
+
     from google import genai
     from google.genai import types
 
@@ -208,6 +210,20 @@ async def _llm_call_with_timeout(
     return await asyncio.wait_for(coro, timeout=LLM_TIMEOUT_SECONDS)
 
 
+# ── Introspection ─────────────────────────────────────────────────────────────
+
+def llm_enabled() -> bool:
+    """
+    True when a real network call to the provider will be attempted.
+
+    Callers use this to decide whether rate-limiting is even needed — throttling
+    a canned-fallback run just makes the demo slow for no reason.
+    """
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    api_key_env = "GROQ_API_KEY" if provider == "groq" else "GEMINI_API_KEY"
+    return bool(os.getenv(api_key_env, "").strip())
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def get_llm_rationale(
@@ -228,8 +244,7 @@ async def get_llm_rationale(
     canned = _CANNED[category]
 
     # If no API key configured, skip the LLM call entirely (dev mode)
-    api_key_env = "GROQ_API_KEY" if provider == "groq" else "GEMINI_API_KEY"
-    if not os.getenv(api_key_env, "").strip():
+    if not llm_enabled():
         logger.info("llm.skipped_no_api_key", extra={
             "provider": provider,
             "category": category.value,

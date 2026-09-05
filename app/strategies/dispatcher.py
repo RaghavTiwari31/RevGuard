@@ -2,9 +2,10 @@
 RevGuard — Action Dispatcher: All Four Recovery Strategies
 
 Strategy 1 — Silent Delayed Retry (TRANSIENT_DOWNTIME)
-  Schedule a background retry job via APScheduler, keyed to a simple bank
-  uptime lookup table.  If the issuer is in extended backoff (Issuer Health
-  Radar), delay is doubled.
+  Schedule a real background retry, keyed to a simple bank uptime lookup table.
+  If the issuer is in extended backoff (Issuer Health Radar), the delay is
+  doubled.  Retries are persisted to the database and rearmed at startup, so
+  they survive the free tier's idle spin-down — see `app.retry_queue`.
 
 Strategy 2 — Payment Link Generation (TEMPORARY_CASHFLOW)
   Call the Razorpay SDK to create a test-mode Payment Link whose amount
@@ -28,12 +29,20 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
-from app.channels import Channel, DispatchRecord, dispatch, select_channel, get_channel_cost
+from app.bandit import select_channel_bandit
+from app.channels import (
+    Channel,
+    DispatchRecord,
+    dispatch,
+    eligible_channels,
+    select_channel,
+)
 from app.classifier import FailureCategory
 from app.logging_config import get_logger
 from app.policy import Policy, get_policy
+from app.retry_queue import cancel_retries_for_event, schedule_retry
 
 logger = get_logger(__name__)
 
@@ -88,6 +97,29 @@ class StrategyResult:
     razorpay_payment_link_url: Optional[str] = None
     retry_scheduled_at: Optional[datetime] = None
     metadata: dict = field(default_factory=dict)
+
+
+# ── Channel selection ─────────────────────────────────────────────────────────
+
+def choose_channel(
+    segment: str,
+    amount_inr: float,
+    customer_phone: Optional[str],
+    policy: Policy,
+) -> Channel:
+    """
+    Pick the outreach channel for one event.
+
+    Eligibility is always decided by policy first, so the bandit can only ever
+    choose among channels the guardrails already permit — it cannot learn its
+    way past the voice-call floor or invent a channel we cannot reach.
+    """
+    eligible = eligible_channels(amount_inr, customer_phone, policy)
+
+    if policy.enable_adaptive_channel_bandit:
+        return select_channel_bandit(segment=segment, eligible=eligible)
+
+    return select_channel(amount_inr, customer_phone, policy)
 
 
 # ── Razorpay SDK helper ───────────────────────────────────────────────────────
@@ -189,18 +221,29 @@ def create_payment_link(
 
 # ── Strategy 1: Silent Delayed Retry (TRANSIENT_DOWNTIME) ────────────────────
 
-def strategy_silent_retry(
+async def strategy_silent_retry(
     event_id: str,
     amount_paise: int,
     bank: Optional[str],
     outreach_message: str,
     customer_phone: Optional[str],
     in_extended_backoff: bool = False,
+    attempt_number: int = 1,
+    session=None,
     policy: Optional[Policy] = None,
 ) -> StrategyResult:
     """
-    Schedule a silent retry during optimal banking hours.
-    If the issuer is in extended backoff, double the delay.
+    Schedule a real, durable retry during optimal banking hours.
+
+    The delay comes from a per-bank uptime table; if the Issuer Health Radar has
+    flagged the issuer as being in an outage, it is doubled so we are not
+    hammering a bank that is already down.
+
+    The retry is persisted (see `app.retry_queue`) rather than living only in
+    APScheduler's memory, because the deployment target idles the process out
+    after ~15 minutes and an in-memory schedule would quietly lose every
+    pending retry exactly when retries are pending.
+
     No outreach is sent — hence 'silent'.
     """
     if policy is None:
@@ -215,24 +258,26 @@ def strategy_silent_retry(
     delay_minutes = base_delay * _EXTENDED_BACKOFF_MULTIPLIER if in_extended_backoff else base_delay
     retry_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
 
-    # Schedule via APScheduler (best-effort — scheduler may not be running in test)
-    try:
-        from app.scheduler import get_scheduler
-        scheduler = get_scheduler()
-        if scheduler.running:
-            scheduler.add_job(
-                func=_retry_noop,           # Phase 2 stub; Phase 3 wires this to triage
-                trigger="date",
-                run_date=retry_at,
-                id=f"retry_{event_id}_{retry_at.timestamp():.0f}",
-                args=[event_id],
-                replace_existing=True,
-            )
-    except Exception as exc:
-        logger.warning("scheduler.add_job_failed", extra={"error": str(exc)})
+    retry_id = None
+    if session is not None:
+        row = await schedule_retry(
+            session=session,
+            event_id=event_id,
+            run_at=retry_at,
+            attempt_number=attempt_number + 1,
+            reason=(
+                "Issuer in extended backoff" if in_extended_backoff
+                else f"Transient failure at {bank or 'unknown bank'}"
+            ),
+            policy=policy,
+        )
+        if row is not None:
+            retry_id = row.retry_id
+            retry_at = row.run_at
 
     logger.info("strategy.silent_retry", extra={
         "event_id": event_id,
+        "retry_id": retry_id,
         "delay_minutes": delay_minutes,
         "retry_at": retry_at.isoformat(),
         "in_extended_backoff": in_extended_backoff,
@@ -247,13 +292,10 @@ def strategy_silent_retry(
             "delay_minutes": delay_minutes,
             "bank": bank,
             "in_extended_backoff": in_extended_backoff,
+            "retry_id": retry_id,
+            "retry_persisted": retry_id is not None,
         },
     )
-
-
-async def _retry_noop(event_id: str) -> None:
-    """Placeholder retry job — Phase 3 will replace this with actual triage replay."""
-    logger.info("scheduler.retry_fired", extra={"event_id": event_id})
 
 
 # ── Strategy 2: Payment Link (TEMPORARY_CASHFLOW) ────────────────────────────
@@ -265,6 +307,7 @@ def strategy_payment_link(
     customer_name: Optional[str],
     customer_email: Optional[str],
     customer_phone: Optional[str],
+    segment: str = FailureCategory.TEMPORARY_CASHFLOW.value,
     policy: Optional[Policy] = None,
 ) -> StrategyResult:
     """
@@ -288,7 +331,8 @@ def strategy_payment_link(
     full_message = f"{outreach_message}\n\nPayment Link: {link_url}"
 
     # Dispatch via selected channel
-    channel = select_channel(
+    channel = choose_channel(
+        segment=segment,
         amount_inr=amount_paise / 100,
         customer_phone=customer_phone,
         policy=policy,
@@ -317,23 +361,32 @@ def strategy_mandate_reregistration(
     outreach_message: str,
     customer_phone: Optional[str],
     customer_email: Optional[str],
+    amount_paise: int = 0,
+    segment: str = FailureCategory.EXPIRED_MANDATE.value,
     policy: Optional[Policy] = None,
 ) -> StrategyResult:
     """
     Send a mandate re-registration link via the best channel.
     The LLM drafts the message; we validate tone before dispatch.
-    A Promise-to-Pay follow-up flow can be triggered by customer reply (Phase 3).
+
+    A customer's reply to this message arrives at POST /webhook/reply, where the
+    same deterministic classifier decides whether it is a promise to pay or a
+    dispute — and a dispute freezes automation and cancels any armed retry.
     """
     if policy is None:
         policy = get_policy()
 
-    # Mock mandate re-registration link (Razorpay Subscriptions API in Phase 4)
+    # Mandate re-registration link. Razorpay's Subscriptions API needs a
+    # configured subscription plan on a verified account, which is out of scope
+    # for a test-mode deployment, so this is a deterministic stand-in — the same
+    # shape and the same dispatch path a real link would take.
     import uuid
     mandate_link = f"https://rzp.io/mandate/{uuid.uuid4().hex[:10]}"
     full_message = f"{outreach_message}\n\nMandate renewal link: {mandate_link}"
 
-    channel = select_channel(
-        amount_inr=1000,  # Arbitrary — no amount for mandate
+    channel = choose_channel(
+        segment=segment,
+        amount_inr=amount_paise / 100,
         customer_phone=customer_phone,
         policy=policy,
     )
@@ -352,21 +405,32 @@ def strategy_mandate_reregistration(
 
 # ── Strategy 4: Circuit Breaker / Escalation ─────────────────────────────────
 
-def strategy_circuit_breaker(
+async def strategy_circuit_breaker(
     event_id: str,
     reason: str,
     category: FailureCategory,
     outreach_message: Optional[str] = None,
     customer_phone: Optional[str] = None,
+    session=None,
     policy: Optional[Policy] = None,
 ) -> StrategyResult:
     """
     Freeze all automation for this record.
     For DISPUTE_OR_OPTOUT: send a brief acknowledgment and freeze.
     For UNRECOVERABLE_FRAUD: log only — do NOT contact customer.
+
+    Freezing also disarms any retry already scheduled for this event.  Without
+    that, a retry armed 20 minutes ago would still fire after the customer has
+    disputed the charge — the single worst failure mode this system could have.
     """
     if policy is None:
         policy = get_policy()
+
+    cancelled_retries = 0
+    if session is not None:
+        cancelled_retries = await cancel_retries_for_event(
+            session, event_id, f"Circuit breaker: {reason}"[:256]
+        )
 
     dispatch_record = None
 
@@ -379,6 +443,7 @@ def strategy_circuit_breaker(
         "reason": reason,
         "category": category.value,
         "customer_notified": dispatch_record is not None,
+        "cancelled_retries": cancelled_retries,
     })
 
     return StrategyResult(
@@ -389,13 +454,14 @@ def strategy_circuit_breaker(
             "reason": reason,
             "category": category.value,
             "automation_frozen": True,
+            "cancelled_retries": cancelled_retries,
         },
     )
 
 
 # ── Dispatcher entry point ────────────────────────────────────────────────────
 
-def dispatch_action(
+async def dispatch_action(
     category: FailureCategory,
     event_id: str,
     amount_paise: int,
@@ -409,6 +475,7 @@ def dispatch_action(
     in_extended_backoff: bool = False,
     attempt_number: int = 1,
     is_stop_keyword: bool = False,
+    session=None,
     policy: Optional[Policy] = None,
 ) -> StrategyResult:
     """
@@ -428,12 +495,13 @@ def dispatch_action(
             "category": category.value,
             "event_id": event_id,
         })
-        return strategy_circuit_breaker(
+        return await strategy_circuit_breaker(
             event_id=event_id,
             reason=f"Confidence {confidence:.2f} below threshold {policy.min_confidence_for_autonomous_action}",
             category=FailureCategory.DISPUTE_OR_OPTOUT,  # Treat as escalation
             outreach_message=None,
             customer_phone=customer_phone,
+            session=session,
             policy=policy,
         )
 
@@ -443,7 +511,7 @@ def dispatch_action(
         or category in (FailureCategory.DISPUTE_OR_OPTOUT, FailureCategory.UNRECOVERABLE_FRAUD)
         or attempt_number > policy.max_retry_attempts
     ):
-        return strategy_circuit_breaker(
+        return await strategy_circuit_breaker(
             event_id=event_id,
             reason=(
                 "Stop keyword detected" if is_stop_keyword
@@ -455,18 +523,21 @@ def dispatch_action(
             category=category,
             outreach_message=outreach_message if category == FailureCategory.DISPUTE_OR_OPTOUT else None,
             customer_phone=customer_phone,
+            session=session,
             policy=policy,
         )
 
     # ── Strategy 1: Transient downtime → silent retry ─────────────────────────
     if category == FailureCategory.TRANSIENT_DOWNTIME:
-        return strategy_silent_retry(
+        return await strategy_silent_retry(
             event_id=event_id,
             amount_paise=amount_paise,
             bank=bank,
             outreach_message=outreach_message,
             customer_phone=customer_phone,
             in_extended_backoff=in_extended_backoff,
+            attempt_number=attempt_number,
+            session=session,
             policy=policy,
         )
 
@@ -479,6 +550,7 @@ def dispatch_action(
             customer_name=customer_name,
             customer_email=customer_email,
             customer_phone=customer_phone,
+            segment=category.value,
             policy=policy,
         )
 
@@ -489,14 +561,17 @@ def dispatch_action(
             outreach_message=outreach_message,
             customer_phone=customer_phone,
             customer_email=customer_email,
+            amount_paise=amount_paise,
+            segment=category.value,
             policy=policy,
         )
 
     # Default fallback — should never reach here given the category enum
     logger.error("dispatcher.unknown_category", extra={"category": category.value})
-    return strategy_circuit_breaker(
+    return await strategy_circuit_breaker(
         event_id=event_id,
         reason=f"Unknown category: {category.value}",
         category=category,
+        session=session,
         policy=policy,
     )

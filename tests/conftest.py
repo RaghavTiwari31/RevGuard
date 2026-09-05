@@ -9,9 +9,6 @@ Provides:
 
 from __future__ import annotations
 
-import asyncio
-import os
-import uuid
 from pathlib import Path
 
 import pytest
@@ -19,10 +16,9 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.db import Base, init_db, _session_factory
+from app.db import Base
 from app.logging_config import setup_logging
-from app.policy import Policy, load_policy, _policy  # noqa: F401 (reset in fixture)
-
+from app.policy import Policy, _policy, load_policy  # noqa: F401 (reset in fixture)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 setup_logging()

@@ -17,9 +17,7 @@ Returns a TriageResult that is persisted in the Trace row and emitted over SSE.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,7 +27,12 @@ from app.issuer_radar import is_in_extended_backoff, record_failure
 from app.llm import LLMResult, get_llm_rationale
 from app.logging_config import get_logger
 from app.policy import Policy, get_policy
-from app.strategies.dispatcher import ActionType, OutcomeStatus, StrategyResult, dispatch_action
+from app.strategies.dispatcher import (  # noqa: F401
+    ActionType,
+    OutcomeStatus,
+    StrategyResult,
+    dispatch_action,
+)
 from app.validator import PostFlightResult, run_post_flight
 
 logger = get_logger(__name__)
@@ -188,7 +191,7 @@ async def run_triage(
     final_message = post_flight.tone_check.sanitised_message
 
     # ── Step 6: Action Dispatcher ────────────────────────────────────────────
-    strategy_result = dispatch_action(
+    strategy_result = await dispatch_action(
         category=classification.category,
         event_id=event_id,
         amount_paise=amount_paise,
@@ -202,6 +205,7 @@ async def run_triage(
         in_extended_backoff=in_backoff,
         attempt_number=attempt_number,
         is_stop_keyword=classification.is_stop_keyword,
+        session=session,
         policy=policy,
     )
 

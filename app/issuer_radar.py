@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, select, update
+from sqlalchemy import Column, DateTime, Integer, String, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base
@@ -145,6 +145,10 @@ async def record_failure(
 
     # Check for spike
     if row.rolling_failures >= spike_threshold:
+        # Capture the count *before* resetting the window, otherwise the audit
+        # line reports the post-reset value and understates the outage.
+        failures_in_window = row.rolling_failures
+
         row.in_extended_backoff = 1
         row.extended_backoff_until = now + timedelta(hours=extended_backoff_hours)
         row.rolling_failures = 0
@@ -152,7 +156,9 @@ async def record_failure(
 
         logger.warning("issuer_radar.spike_detected", extra={
             "bin": bin_clean,
-            "total_failures_in_window": row.rolling_failures + spike_threshold,
+            "total_failures_in_window": failures_in_window,
+            "spike_threshold": spike_threshold,
+            "window_minutes": window_minutes,
             "extended_backoff_until": row.extended_backoff_until.isoformat(),
         })
         return True

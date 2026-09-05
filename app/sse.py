@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from typing import AsyncGenerator
 
 from app.logging_config import get_logger

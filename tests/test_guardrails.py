@@ -11,16 +11,13 @@ Tests cover all four guardrail checks against the Phase 1 Definition of Done:
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-import pytest
-import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import Customer, IdempotencyLock
+from app.db import Customer
 from app.guardrails import (
     check_anti_spam,
     check_idempotency,
@@ -29,7 +26,6 @@ from app.guardrails import (
     run_pre_flight,
 )
 from app.policy import Policy
-
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -83,7 +79,14 @@ class TestIdempotency:
         # Second attempt with the same event_id
         r2 = await check_idempotency(async_session, event_id, _trace_id(), policy)
         assert r2.passed is False
-        assert "Duplicate" in r2.reason or "already processed" in r2.reason
+        # The lock is still within its TTL and was never completed, so this is
+        # reported as an in-flight attempt rather than a settled duplicate.
+        # Either way the second attempt is refused.
+        assert (
+            "Duplicate" in r2.reason
+            or "already processed" in r2.reason
+            or "being processed" in r2.reason
+        )
 
     async def test_ten_concurrent_same_event_id_exactly_one_passes(self):
         """
@@ -95,8 +98,9 @@ class TestIdempotency:
         check the count — the important invariant is that the lock table only
         has 1 row after 10 attempts.
         """
-        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
         from sqlalchemy import select as sa_select
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
         from app.db import Base, IdempotencyLock
 
         engine = create_async_engine(
