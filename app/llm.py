@@ -291,3 +291,85 @@ async def get_llm_rationale(
             hinglish_message=canned["hinglish_message"],
             provider_used="canned_fallback",
         )
+
+# ── Conversational Support Layer ──────────────────────────────────────────────
+
+async def generate_support_reply(customer_message: str, context: Optional[dict]) -> str:
+    """
+    Generate a smart, context-aware reply to an incoming WhatsApp message from a customer.
+    """
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    
+    context_str = "No recent failed transaction found for this customer."
+    if context:
+        context_str = f"""
+Recent Failed Transaction Context:
+- Amount: ₹{context.get('amount_inr', 'Unknown')}
+- Error Code: {context.get('error_code', 'Unknown')}
+- Error Reason: {context.get('error_reason', 'Unknown')}
+- Status/Rule: {context.get('classification_rule', 'Unknown')}
+- Timestamp: {context.get('timestamp', 'Unknown')}
+"""
+
+    prompt = f"""You are RevGuard, a helpful revenue recovery assistant for an Indian fintech company.
+A customer has replied to our automated WhatsApp message regarding their failed payment.
+
+{context_str}
+
+Customer's Message: "{customer_message}"
+
+Your Task:
+Respond to the customer directly. 
+- Be incredibly polite and helpful.
+- Keep the response short (max 2-3 sentences).
+- Use a friendly Hinglish tone (conversational Hindi + English).
+- Do not make up facts. Only use the context provided.
+- If the payment failed due to insufficient funds (cashflow) or temporary downtime, reassure them and tell them to try the payment link again later.
+
+Generate ONLY the exact text message to send back to the customer. No JSON, no markdown fences.
+"""
+
+    try:
+        # We can reuse the timeout wrapper since it just expects a prompt and returns a dict/string.
+        # But wait, _llm_call_with_timeout is hardcoded to expect JSON from the existing _call_groq/_call_gemini functions.
+        # Let's bypass the JSON parsing and call the API directly for this text generation.
+        
+        if provider == "gemini":
+            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", ""))
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.7,
+                    max_output_tokens=300,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            text = response.text
+            if text is None:
+                for candidate in (response.candidates or []):
+                    for part in (getattr(candidate.content, "parts", None) or []):
+                        if getattr(part, "thought", False): continue
+                        if getattr(part, "text", None):
+                            text = part.text
+                            break
+                    if text: break
+            return text.strip() if text else "We are currently experiencing high volume. Our support team will contact you shortly."
+            
+        else: # groq
+            import groq as groq_sdk
+            client = groq_sdk.AsyncGroq(api_key=os.getenv("GROQ_API_KEY", ""))
+            response = await client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=300,
+            )
+            return response.choices[0].message.content.strip()
+
+    except Exception as exc:
+        logger.error("llm.support_reply_error", extra={"error": str(exc)})
+        return "Namaste! Hamari support team abhi available nahi hai. Hum jald hi aapse sampark karenge. 🙏"

@@ -4,6 +4,7 @@
 # Web framework & ASGI
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
+python-multipart==0.0.91
 
 # Validation
 pydantic==2.9.2
@@ -16,6 +17,7 @@ asyncpg==0.29.0
 
 # Scheduling
 apscheduler==3.10.4
+twilio==9.2.2
 
 # HTTP client
 httpx==0.27.2

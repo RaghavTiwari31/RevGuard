@@ -22,6 +22,7 @@ from app.routers.webhook import router as webhook_router
 from app.routers.stream import router as stream_router
 from app.routers.simulate import router as simulate_router
 from app.routers.policy_api import router as policy_router
+from app.routers.twilio import router as twilio_router
 from app.scheduler import start_scheduler, stop_scheduler
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -109,3 +110,4 @@ app.include_router(webhook_router)
 app.include_router(stream_router)
 app.include_router(simulate_router)
 app.include_router(policy_router)
+app.include_router(twilio_router)
