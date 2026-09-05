@@ -79,7 +79,10 @@ export default function TransactionDetailsDrawer() {
   const category = categoryStyle(ev.category)
   const outcome = outcomeStyle(ev.outcome_status)
   const frozen = isFrozen(ev.action_type)
-  const hasMessage = Boolean(ev.hinglish_message)
+  const hasMessage = !!selectedEvent.hinglish_message
+  const isDropped = selectedEvent.action_type === 'DROPPED_NO_ACTION' || selectedEvent.action_type === 'ESCALATED_HUMAN_ATTENTION'
+  const isSilentRetry = selectedEvent.action_type === 'SCHEDULE_RETRY'
+  const messageNotSent = isDropped || isSilentRetry
 
   // Guardrail results may be absent on live webhook events — absent means the
   // check did not report a failure, so default to pass rather than to alarm.
@@ -230,9 +233,9 @@ export default function TransactionDetailsDrawer() {
               </div>
 
               <div className="min-h-[168px] bg-[#e9edef] p-4">
-                {!hasMessage || frozen ? (
+                {!hasMessage || messageNotSent ? (
                   <p className="mt-10 text-center text-xs italic text-gray-500">
-                    No automated message dispatched — automation frozen for this record.
+                    {isSilentRetry ? "[Silent Retry — No automated message dispatched]" : "No automated message dispatched — automation frozen for this record."}
                   </p>
                 ) : (
                   <div className="max-w-[92%] rounded-lg rounded-tl-sm border border-black/5 bg-white p-3 text-[13px] leading-relaxed text-gray-800 shadow-sm">
