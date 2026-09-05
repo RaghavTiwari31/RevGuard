@@ -36,6 +36,11 @@ services:
       # RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
       # LLM_PROVIDER, GROQ_API_KEY (or GEMINI_API_KEY) — optional; without a
       #   key the pipeline runs on canned rationales instead of failing
+      #
+      # TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_SENDER —
+      #   optional. All three together enable real WhatsApp sending and the
+      #   inbound /twilio/webhook reply flow; with any missing, dispatch is
+      #   logged and skipped rather than failing.
       # ALLOWED_ORIGINS  (your Vercel URL, e.g. https://revguard.vercel.app)
 
   # ── Database (PostgreSQL) ─────────────────────────────────────────────────────

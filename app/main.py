@@ -27,6 +27,7 @@ from app.routers.retries import router as retries_router
 from app.routers.simulate import router as simulate_router
 from app.routers.stream import router as stream_router
 from app.routers.traces import router as traces_router
+from app.routers.twilio import router as twilio_router
 from app.routers.webhook import router as webhook_router
 from app.scheduler import start_scheduler, stop_scheduler
 from app.schemas import HealthResponse
@@ -155,3 +156,4 @@ app.include_router(policy_router)
 app.include_router(traces_router)
 app.include_router(issuers_router)
 app.include_router(retries_router)
+app.include_router(twilio_router)

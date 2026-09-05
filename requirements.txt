@@ -17,6 +17,11 @@ asyncpg==0.29.0
 # Scheduling
 apscheduler==3.10.4
 
+# Outbound messaging (real WhatsApp/SMS via Twilio)
+twilio==9.2.2
+# Required by FastAPI to parse Twilio's form-encoded webhook posts
+python-multipart==0.0.20
+
 # HTTP client
 httpx==0.28.1
 

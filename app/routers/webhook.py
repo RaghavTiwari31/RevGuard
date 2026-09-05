@@ -28,11 +28,11 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.classifier import classify
-from app.db import Customer, CustomerReply, Event, Trace, get_session_factory
+from app.channels import Channel
+from app.db import Customer, Event, Trace, get_session_factory
 from app.guardrails import complete_idempotency, run_pre_flight
 from app.logging_config import get_logger
-from app.retry_queue import cancel_retries_for_event
+from app.replies import record_inbound_reply
 from app.schemas import RazorpayWebhookPayload
 from app.sse import broadcast
 from app.triage import run_triage
@@ -181,6 +181,27 @@ async def razorpay_webhook(
                 )
                 session.add(event_row)
 
+                # Record the customer and their contact number.
+                #
+                # Nothing created Customer rows before, which quietly disabled
+                # two things: the anti-spam guardrail reads
+                # `Customer.last_contacted_at` and so always saw "no prior
+                # contact" and passed; and an inbound WhatsApp reply had no
+                # phone -> customer mapping to resolve itself against, so it
+                # could not tell which payment it was about.
+                if customer_id:
+                    customer = (
+                        await session.execute(
+                            select(Customer).where(Customer.customer_id == customer_id)
+                        )
+                    ).scalars().first()
+                    if customer is None:
+                        customer = Customer(customer_id=customer_id)
+                        session.add(customer)
+                    if payment:
+                        customer.phone = payment.contact or customer.phone
+                        customer.email = payment.email or customer.email
+
             # ── 5. Persist initial Trace row ──────────────────────────────────
             trace_row = Trace(
                 trace_id=trace_id,
@@ -250,6 +271,19 @@ async def razorpay_webhook(
             trace_row.triage_metadata = json.dumps(triage.strategy.metadata)
             if triage.strategy.retry_scheduled_at:
                 trace_row.retry_scheduled_at = triage.strategy.retry_scheduled_at
+
+            # Stamp the contact time only when outreach actually went out.
+            # A silent retry sends nothing, so it must not start a cooldown
+            # that would suppress a later, genuine message.
+            record = triage.strategy.dispatch_record
+            if customer_id and record is not None and record.channel != Channel.NONE:
+                contacted = (
+                    await session.execute(
+                        select(Customer).where(Customer.customer_id == customer_id)
+                    )
+                ).scalars().first()
+                if contacted is not None:
+                    contacted.last_contacted_at = datetime.now(timezone.utc)
 
             session.add(trace_row)
             # The lock stops expiring now: this event is definitively processed,
@@ -330,108 +364,25 @@ async def customer_reply(
     so the DISPUTE_OR_OPTOUT path could only ever be reached through an error
     description — never through a customer actually saying "stop".
 
-    On a stop keyword or dispute signal the response is immediate and total:
-      1. the reply is stored verbatim, so the decision is auditable
-      2. every pending retry for the payment is cancelled
-      3. the customer is marked as contacted, freezing further outreach
-      4. the freeze is broadcast to the dashboard
-
-    Everything else is recorded and acknowledged without changing automation.
+    The decision itself lives in `app.replies.record_inbound_reply`, shared with
+    the Twilio transport, so a "stop" means the same thing however it arrives.
     """
     require_signature(await request.body(), x_razorpay_signature)
 
-    reply_id = f"rpl_{uuid.uuid4().hex[:16]}"
-    now = datetime.now(timezone.utc)
-
-    # The classifier is the single source of truth for what a reply means —
-    # the same deterministic rules the payment path uses, no second opinion.
-    classification = classify(
-        error_code=None,
-        error_reason=None,
-        error_description=None,
-        customer_reply=payload.body,
+    result = await record_inbound_reply(
+        payload.body,
+        channel=payload.channel,
+        phone=payload.phone,
+        customer_id=payload.customer_id,
+        event_id=payload.event_id,
     )
-    is_stop = classification.is_stop_keyword
-
-    logger.info("reply.received", extra={
-        "reply_id": reply_id,
-        "event_id": payload.event_id,
-        "channel": payload.channel,
-        "category": classification.category.value,
-        "is_stop_keyword": is_stop,
-    })
-
-    cancelled = 0
-    action_taken = "LOGGED_NO_ACTION"
-    factory = get_session_factory()
-
-    async with factory() as session:
-        async with session.begin():
-            if is_stop:
-                action_taken = "AUTOMATION_FROZEN"
-
-                if payload.event_id:
-                    cancelled = await cancel_retries_for_event(
-                        session,
-                        payload.event_id,
-                        f"Customer reply classified as {classification.category.value}",
-                    )
-
-                # Push last_contacted_at forward so the anti-spam guardrail
-                # suppresses outreach even on paths that do not consult the
-                # retry queue at all.
-                if payload.customer_id:
-                    customer = (
-                        await session.execute(
-                            select(Customer).where(Customer.customer_id == payload.customer_id)
-                        )
-                    ).scalars().first()
-                    if customer is None:
-                        customer = Customer(
-                            customer_id=payload.customer_id, phone=payload.phone
-                        )
-                        session.add(customer)
-                    customer.last_contacted_at = now
-
-            session.add(CustomerReply(
-                reply_id=reply_id,
-                event_id=payload.event_id,
-                customer_id=payload.customer_id,
-                phone=payload.phone,
-                channel=payload.channel,
-                body=payload.body,
-                category=classification.category.value,
-                is_stop_keyword=is_stop,
-                action_taken=action_taken,
-                received_at=now,
-            ))
-
-    if is_stop:
-        logger.warning("reply.automation_frozen", extra={
-            "reply_id": reply_id,
-            "event_id": payload.event_id,
-            "customer_id": payload.customer_id,
-            "cancelled_retries": cancelled,
-            "matched_rule": classification.matched_rule,
-        })
-        await broadcast({
-            "type": "automation_frozen",
-            "reply_id": reply_id,
-            "event_id": payload.event_id,
-            "customer_id": payload.customer_id,
-            "category": classification.category.value,
-            "matched_rule": classification.matched_rule,
-            "cancelled_retries": cancelled,
-            "body": payload.body[:280],
-            "timestamp": now.isoformat().replace("+00:00", "Z"),
-        })
 
     return {
-        "status": "frozen" if is_stop else "acknowledged",
-        "reply_id": reply_id,
-        "category": classification.category.value,
-        "matched_rule": classification.matched_rule,
-        "is_stop_keyword": is_stop,
-        "action_taken": action_taken,
-        "cancelled_retries": cancelled,
+        "status": result.status,
+        "reply_id": result.reply_id,
+        "category": result.category,
+        "matched_rule": result.matched_rule,
+        "is_stop_keyword": result.is_stop_keyword,
+        "action_taken": result.action_taken,
+        "cancelled_retries": result.cancelled_retries,
     }
