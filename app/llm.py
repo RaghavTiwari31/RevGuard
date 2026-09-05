@@ -390,4 +390,4 @@ Generate ONLY the exact text message to send back to the customer. No JSON, no m
 
     except Exception as exc:
         logger.error("llm.support_reply_error", extra={"error": str(exc)})
-        return "Namaste! Hamari support team abhi available nahi hai. Hum jald hi aapse sampark karenge. 🙏"
+        return "Namaste! Agar aapka payment fail ho gaya hai, toh chinta na karein. Humne ise system mein note kar liya hai. Jald hi aapko ek naya payment link bheja jayega. 🙏"
